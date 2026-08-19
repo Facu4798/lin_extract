@@ -12,7 +12,7 @@ from sqlglot import exp
 
 from lineage.errors import FieldNotFoundError, StructFieldNotFoundError
 from lineage.file_parser import parse_file
-from lineage.models import DfStatement, LineageResult, TraceNode, normalize_ident
+from lineage.models import DfStatement, LineageResult, SourceRef, TraceNode, normalize_ident
 from lineage.sql_parser import parse_statement
 
 MAX_DEPTH = 200  # defensive guard against cycles in malformed input (§3.4)
@@ -254,7 +254,23 @@ class _Resolver:
                 return
 
         node_label = col_sql
+        self._resolve_via_source(source, col_name, struct_path, ctx_stmt.name, node_label, parent, visited, depth)
 
+    def _resolve_via_source(
+        self,
+        source: SourceRef,
+        col_name: str,
+        struct_path: list,
+        referencing_df_name: str,
+        node_label: str,
+        parent: TraceNode,
+        visited: frozenset,
+        depth: int,
+    ) -> None:
+        """Continue resolution once a column reference has been matched to a
+        specific FROM/JOIN source (real table, or another df to recurse
+        into). Factored out so the ``SELECT *`` single-source passthrough
+        below can reuse the exact same real-table/df dispatch logic."""
         if source.is_real_table is None:
             reason = source.unsupported_reason or f"could not classify source '{source.ref_name}'"
             self.unresolved.append(reason)
@@ -269,7 +285,7 @@ class _Resolver:
         # source is another df in the chain — recurse (§3.3(b), edge case #4)
         dep_stmt = self.ctx.get(source.ref_name)
         if dep_stmt is None:
-            reason = f"df '{source.ref_name}' referenced by '{ctx_stmt.name}' was not found in the chain"
+            reason = f"df '{source.ref_name}' referenced by '{referencing_df_name}' was not found in the chain"
             self.unresolved.append(reason)
             parent.children.append(TraceNode(label=node_label, kind="unresolved", detail=reason))
             return
@@ -284,9 +300,31 @@ class _Resolver:
         dep_entry = dep_stmt.projections.get(normalize_ident(col_name))
         if dep_entry is None:
             if dep_stmt.has_star:
+                # A bare SELECT * with exactly one FROM/JOIN source has no
+                # ambiguity about where any given column comes from — every
+                # column it exposes passes straight through from that one
+                # source, whatever it's named, so resolve directly into it
+                # (recursing further if that source is itself a df, possibly
+                # with its own SELECT *). With 2+ sources we can't tell which
+                # one actually has the column without schema info, so that
+                # case stays explicitly unresolved rather than guessing.
+                if len(dep_stmt.sources) == 1:
+                    passthrough_label = f"{node_label} (via SELECT * in '{dep_stmt.name}')"
+                    self._resolve_via_source(
+                        dep_stmt.sources[0],
+                        col_name,
+                        struct_path,
+                        dep_stmt.name,
+                        passthrough_label,
+                        parent,
+                        visited | {dep_key},
+                        depth + 1,
+                    )
+                    return
                 reason = (
-                    f"df '{dep_stmt.name}' uses SELECT * — cannot determine which "
-                    f"source column maps to '{col_name}' without table schema information"
+                    f"df '{dep_stmt.name}' uses SELECT * over {len(dep_stmt.sources)} "
+                    f"FROM/JOIN sources — cannot determine which one provides "
+                    f"'{col_name}' without table schema information"
                 )
             else:
                 reason = (
