@@ -425,6 +425,50 @@ class _Resolver:
             located = [(0, branches[0], branches[0].projections.get(normalize_ident(col_name)))]
         else:
             found = self._branch_entries_for(dep_stmt, col_name)
+            if found is None and branches[0].has_star:
+                # The first branch is a bare SELECT * — we can't see its
+                # column names statically, so position-based matching for
+                # the OTHER branches is impossible too (we don't even know
+                # which position col_name would be at). Best we can do:
+                # resolve branch 0 itself via the same single-source star
+                # passthrough used elsewhere, and flag every other branch
+                # individually (accurately, not as "column not found")
+                # rather than failing the whole union outright.
+                container = TraceNode(label=f"UNION ({dep_stmt.name})", kind="union")
+                parent.children.append(container)
+                branch0_label = f"{node_label} [branch 1/{n}]"
+                if len(branches[0].sources) == 1:
+                    self._resolve_via_source(
+                        branches[0].sources[0],
+                        col_name,
+                        struct_path,
+                        dep_stmt.name,
+                        f"{branch0_label} (via SELECT * in '{dep_stmt.name}')",
+                        container,
+                        visited,
+                        depth + 1,
+                    )
+                else:
+                    reason = (
+                        f"df '{dep_stmt.name}' [branch 1/{n}] uses SELECT * over "
+                        f"{len(branches[0].sources)} FROM/JOIN sources — cannot "
+                        f"determine which one provides '{col_name}' without "
+                        f"table schema information"
+                    )
+                    self.unresolved.append(reason)
+                    container.children.append(TraceNode(label=branch0_label, kind="unresolved", detail=reason))
+                for i in range(1, n):
+                    reason = (
+                        f"df '{dep_stmt.name}' [branch {i + 1}/{n}]: position of "
+                        f"'{col_name}' can't be determined because the first "
+                        f"branch is SELECT * (its column names aren't visible "
+                        f"without table schema information)"
+                    )
+                    self.unresolved.append(reason)
+                    container.children.append(
+                        TraceNode(label=f"{node_label} [branch {i + 1}/{n}]", kind="unresolved", detail=reason)
+                    )
+                return
             if found is None:
                 reason = (
                     f"df '{dep_stmt.name}' is a UNION whose first branch does not "
