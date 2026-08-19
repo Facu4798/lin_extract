@@ -206,18 +206,36 @@ class _Resolver:
         visited: frozenset,
         depth: int,
     ) -> None:
-        col_name = col.name
-        table_part = col.table  # '' if unqualified
+        # col.parts gives every dot-separated identifier left-to-right. For
+        # 3+ parts (e.g. "df_item_0.item.customerCode"), this is Spark's
+        # native syntax for reaching into a nested struct-typed *source*
+        # column: parts[0] is the alias, parts[1] is the column, and
+        # parts[2:] is a struct sub-field path that only narrows which
+        # nested value is read — it doesn't change which table/column feeds
+        # it, so it's carried through for the trace but not required to
+        # resolve further (we drill into it only if it turns out to
+        # address one of our own STRUCT(...) expressions).
+        parts = [p.name for p in col.parts]
+        col_sql = col.sql()
+
+        if len(parts) >= 2:
+            table_part = parts[0]
+            col_name = parts[1]
+            struct_path = parts[2:]
+        else:
+            table_part = ""
+            col_name = parts[0]
+            struct_path = []
 
         if table_part:
             matches = [s for s in ctx_stmt.sources if normalize_ident(s.alias) == normalize_ident(table_part)]
             if not matches:
                 reason = (
-                    f"alias '{table_part}' referenced by column '{col.sql()}' "
+                    f"alias '{table_part}' referenced by column '{col_sql}' "
                     f"in df '{ctx_stmt.name}' does not match any FROM/JOIN source"
                 )
                 self.unresolved.append(reason)
-                parent.children.append(TraceNode(label=col.sql(), kind="unresolved", detail=reason))
+                parent.children.append(TraceNode(label=col_sql, kind="unresolved", detail=reason))
                 return
             source = matches[0]
         else:
@@ -235,7 +253,7 @@ class _Resolver:
                 parent.children.append(TraceNode(label=col_name, kind="ambiguous", detail=reason))
                 return
 
-        node_label = f"{table_part}.{col_name}" if table_part else col_name
+        node_label = col_sql
 
         if source.is_real_table is None:
             reason = source.unsupported_reason or f"could not classify source '{source.ref_name}'"
@@ -278,10 +296,31 @@ class _Resolver:
             parent.children.append(TraceNode(label=node_label, kind="unresolved", detail=reason))
             return
 
+        # Drill the leftover struct sub-field path into the dependency's own
+        # expression, but only while it's actually one of our synthesized
+        # STRUCT(...) expressions — otherwise (a plain column, a native
+        # struct-typed source column, etc.) there's nothing more we can
+        # verify without schema info, so just resolve it as-is.
+        expr = dep_entry.expr
+        for part in struct_path:
+            if not isinstance(expr, exp.Struct):
+                break
+            match = next(
+                (
+                    m
+                    for m in expr.expressions
+                    if isinstance(m, exp.PropertyEQ) and normalize_ident(m.name) == normalize_ident(part)
+                ),
+                None,
+            )
+            if match is None:
+                break
+            expr = match.expression
+
         child = TraceNode(label=f"{dep_stmt.name}.{dep_entry.alias}", kind="column")
         parent.children.append(child)
         self._resolve_expr(
-            dep_entry.expr, dep_stmt, child, visited | {dep_key}, depth + 1
+            expr, dep_stmt, child, visited | {dep_key}, depth + 1
         )
 
 
