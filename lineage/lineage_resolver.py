@@ -296,6 +296,21 @@ class _Resolver:
                 self._resolve_expr(node.args["fill_pattern"], ctx_stmt, fn_node, visited, depth + 1)
             return
 
+        if isinstance(node, exp.Replace):
+            # REPLACE(x, search[, replacement]) — the value being
+            # search-and-replaced (.this) is what matters for lineage;
+            # .expression (the search string) and .replacement are almost
+            # always literals but are resolved too in case either is ever a
+            # column, same treatment as TRIM/PAD's optional args.
+            fn_node = TraceNode(label=node.sql(), kind="function")
+            parent.children.append(fn_node)
+            self._resolve_expr(node.this, ctx_stmt, fn_node, visited, depth + 1)
+            if node.args.get("expression") is not None:
+                self._resolve_expr(node.expression, ctx_stmt, fn_node, visited, depth + 1)
+            if node.args.get("replacement") is not None:
+                self._resolve_expr(node.args["replacement"], ctx_stmt, fn_node, visited, depth + 1)
+            return
+
         if isinstance(node, exp.Struct):
             # STRUCT(expr AS field, expr AS field, ...) — nested JSON object
             # construction. sqlglot normalizes every member (explicitly
