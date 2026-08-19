@@ -9,6 +9,7 @@ from lineage.errors import (
     FileParseError,
     SqlParseError,
     FieldNotFoundError,
+    StructFieldNotFoundError,
 )
 from lineage.lineage_resolver import resolve_field_lineage
 
@@ -21,5 +22,6 @@ __all__ = [
     "FileParseError",
     "SqlParseError",
     "FieldNotFoundError",
+    "StructFieldNotFoundError",
     "resolve_field_lineage",
 ]

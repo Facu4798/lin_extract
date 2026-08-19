@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from sqlglot import exp
 
-from lineage.errors import FieldNotFoundError
+from lineage.errors import FieldNotFoundError, StructFieldNotFoundError
 from lineage.file_parser import parse_file
 from lineage.models import DfStatement, LineageResult, TraceNode, normalize_ident
 from lineage.sql_parser import parse_statement
@@ -66,15 +66,45 @@ class _Resolver:
 
     def resolve_field(self, field_name: str) -> LineageResult:
         final = self.ctx.final
-        key = normalize_ident(field_name)
-        entry = final.projections.get(key)
+        path = field_name.split(".")
+        top_key = normalize_ident(path[0])
+        entry = final.projections.get(top_key)
         if entry is None:
             raise FieldNotFoundError(
                 field_name, [p.alias for p in final.projections.values()]
             )
 
+        # Drill into STRUCT(...) sub-fields for a dotted path like
+        # "Address.City" — each remaining path segment must name a member
+        # of a STRUCT at that point (edge case: STRUCT-typed Cosmos fields).
+        expr = entry.expr
+        for depth_i, part in enumerate(path[1:], start=1):
+            if not isinstance(expr, exp.Struct):
+                raise StructFieldNotFoundError(
+                    field_name,
+                    f"'{'.'.join(path[:depth_i])}' is not a STRUCT, "
+                    f"so sub-field '{part}' cannot be resolved",
+                )
+            match = next(
+                (
+                    m
+                    for m in expr.expressions
+                    if isinstance(m, exp.PropertyEQ) and normalize_ident(m.name) == normalize_ident(part)
+                ),
+                None,
+            )
+            if match is None:
+                available = sorted(
+                    m.name for m in expr.expressions if isinstance(m, exp.PropertyEQ)
+                )
+                raise StructFieldNotFoundError(
+                    field_name,
+                    f"no sub-field '{part}' in STRUCT. Available: {', '.join(available) or '<none>'}",
+                )
+            expr = match.expression
+
         trace = TraceNode(label=field_name, kind="field")
-        self._resolve_expr(entry.expr, final, trace, visited=frozenset(), depth=0)
+        self._resolve_expr(expr, final, trace, visited=frozenset(), depth=0)
 
         is_literal_only = len(self.tables) == 0 and len(self.unresolved) == 0
         return LineageResult(
@@ -133,6 +163,27 @@ class _Resolver:
             parent.children.append(fn_node)
             for arg in node.flatten():
                 self._resolve_expr(arg, ctx_stmt, fn_node, visited, depth + 1)
+            return
+
+        if isinstance(node, exp.Struct):
+            # STRUCT(expr AS field, expr AS field, ...) — nested JSON object
+            # construction. sqlglot normalizes every member (explicitly
+            # aliased or not) to a PropertyEQ(name, expr); lineage for the
+            # struct as a whole is the union of every member's lineage.
+            struct_node = TraceNode(label="STRUCT(...)", kind="struct")
+            parent.children.append(struct_node)
+            for member in node.expressions:
+                if isinstance(member, exp.PropertyEQ):
+                    member_label = member.name
+                    member_expr = member.expression
+                else:
+                    # Defensive fallback — shouldn't occur with sqlglot's
+                    # normalization, but don't guess if it does.
+                    member_label = getattr(member, "alias_or_name", "") or "<unnamed>"
+                    member_expr = member
+                field_node = TraceNode(label=member_label, kind="struct_field")
+                struct_node.children.append(field_node)
+                self._resolve_expr(member_expr, ctx_stmt, field_node, visited, depth + 1)
             return
 
         # Anything else (CASE, CAST, window funcs, subqueries, arbitrary

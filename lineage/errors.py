@@ -46,3 +46,13 @@ class FieldNotFoundError(LineageError):
             f"Field '{field_name}' not found in the final SELECT's output "
             f"aliases. Available fields: {avail}"
         )
+
+
+class StructFieldNotFoundError(LineageError):
+    """Raised when a dotted field path (e.g. ``Address.City``) can't be
+    followed — either an intermediate segment's expression isn't a STRUCT,
+    or a named sub-field doesn't exist within one."""
+
+    def __init__(self, field_name: str, message: str):
+        self.field_name = field_name
+        super().__init__(f"Cannot resolve '{field_name}': {message}")
