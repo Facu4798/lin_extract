@@ -7,9 +7,15 @@ than guess, same policy as the ``lineage`` package):
 - **Join keys.** For now (per explicit direction), two source tables are
   only known to be joinable when some golden field coalesces a column from
   each of them — that field's own pair of source columns becomes the join
-  condition. A table that never shares a golden field with any other table
-  has no inferable join key at all, and is reported as a warning rather
-  than silently cross-joined or dropped.
+  condition. When one side of that pairing is itself ambiguous (a source
+  field that resolved to 2+ candidate columns, e.g. from a multi-source
+  ``SELECT *``), every candidate table gets its own *independent* join
+  against the other side, rather than picking one or refusing to join at
+  all — equivalent to "whichever candidate actually matches wins", since
+  each candidate's condition is separate and unmatched ones just stay NULL.
+  A table that never shares a golden field with any other table at all
+  has no inferable join key, and is reported as a warning rather than
+  silently cross-joined or dropped.
 - **Join type.** Every join defaults to LEFT (anchored on the first table
   encountered), since that's the only choice that can never drop a row a
   coalesce might still want data from. If you need a specific join to be
@@ -69,36 +75,53 @@ def build_query(golden_structure_path: str, queries_dir: str) -> BuildResult:
                 warnings.append(f"golden field '{gname}': source field '{sf}': {d}")
             resolved[gname][sf] = hits
 
-    # -- infer join edges: for each golden field, one representative
-    # ResolvedSource per source field (only when unambiguous), then a
-    # chain of equality conditions across the distinct tables involved. ---
+    # -- infer join edges: for each golden field, group its resolved hits by
+    # source field (one group per source field — a group has 1 entry when
+    # unambiguous, 2+ when ambiguous), then connect consecutive groups'
+    # DISTINCT TABLES pairwise. For the common unambiguous case each group
+    # has exactly one table, so this is exactly one edge per adjacent pair
+    # of source fields (same as before). When a group is ambiguous (spans
+    # multiple tables), every one of its tables gets its own independent
+    # edge against every table in the next group — each is a separate join
+    # condition, so an unmatched candidate just contributes NULLs rather
+    # than blocking the real match. -----------------------------------------
     # edge key: frozenset({table_a, table_b}) -> list[(ResolvedSource_a, ResolvedSource_b)]
     join_edges: dict[frozenset, list[tuple[ResolvedSource, ResolvedSource]]] = {}
     all_tables: dict[str, ResolvedSource] = {}  # table_ref -> a representative ResolvedSource (for alias/table name)
 
     for gname, spec in golden_structure.items():
-        reps: list[ResolvedSource] = []
+        groups: list[list[ResolvedSource]] = []
         for sf in spec.source_fields:
             hits = resolved[gname][sf]
-            if len(hits) == 1:
-                reps.append(hits[0])
-            elif len(hits) > 1:
+            if len(hits) > 1:
                 warnings.append(
                     f"golden field '{gname}': source field '{sf}' resolved to "
-                    f"{len(hits)} columns — ambiguous, not used to infer a join key "
-                    f"(still included in the SELECT's COALESCE)"
+                    f"{len(hits)} columns — ambiguous, so each candidate table "
+                    f"gets its own independent join against the other side "
+                    f"instead of one trusted join key (still included in the "
+                    f"SELECT's COALESCE)"
                 )
             for h in hits:
                 all_tables.setdefault(h.table, h)
+            if hits:
+                groups.append(hits)
 
-        # first representative column seen per distinct table, for this field
-        per_table_rep: dict[str, ResolvedSource] = {}
-        for r in reps:
-            per_table_rep.setdefault(r.table, r)
-        distinct = list(per_table_rep.values())
-        for a, b in zip(distinct, distinct[1:]):
-            key = frozenset((a.table, b.table))
-            join_edges.setdefault(key, []).append((a, b))
+        # one representative candidate per distinct table, per group (so an
+        # ambiguous group contributes one candidate per table it touches)
+        table_groups: list[list[ResolvedSource]] = []
+        for g in groups:
+            per_table: dict[str, ResolvedSource] = {}
+            for r in g:
+                per_table.setdefault(r.table, r)
+            table_groups.append(list(per_table.values()))
+
+        for group_a, group_b in zip(table_groups, table_groups[1:]):
+            for a in group_a:
+                for b in group_b:
+                    if a.table == b.table:
+                        continue
+                    key = frozenset((a.table, b.table))
+                    join_edges.setdefault(key, []).append((a, b))
 
     # -- build a join order: spanning tree over all_tables using join_edges,
     # anchored on the first table encountered (dict preserves insertion
