@@ -49,9 +49,15 @@ class FieldNotFoundError(LineageError):
 
 
 class StructFieldNotFoundError(LineageError):
-    """Raised when a dotted field path (e.g. ``Address.City``) can't be
-    followed — either an intermediate segment's expression isn't a STRUCT,
-    or a named sub-field doesn't exist within one."""
+    """No longer raised by the resolver itself — a dotted field path (e.g.
+    ``Address.City``) that can't be followed is now reported the same way
+    every other unresolved branch is: ``LineageResult.has_unresolved_branches``
+    plus a reason in ``unresolved_reasons``, rather than an exception. This
+    keeps it consistent with resolving through however many df hops it
+    takes to find (or fail to find) the STRUCT, instead of only working
+    when the dotted path's target is a STRUCT in the *same* df. Left
+    defined here for backward compatibility with anything still importing
+    or catching it."""
 
     def __init__(self, field_name: str, message: str):
         self.field_name = field_name

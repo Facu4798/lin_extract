@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from sqlglot import exp
 
-from lineage.errors import FieldNotFoundError, StructFieldNotFoundError
+from lineage.errors import FieldNotFoundError
 from lineage.file_parser import parse_file
 from lineage.models import DfStatement, LineageResult, SourceRef, TraceNode, normalize_ident
 from lineage.sql_parser import parse_statement
@@ -107,6 +107,13 @@ class _Resolver:
         final = self.ctx.final
         path = field_name.split(".")
         top_key = path[0]
+        # Any dotted sub-path (e.g. "Address.City") is handed to the general
+        # expression resolver as extra_struct_path — it drills into a
+        # STRUCT(...) wherever one is actually found, chasing through
+        # however many plain column/df hops it takes to get there (e.g. the
+        # struct built in an earlier df and just passed through whole by
+        # the final SELECT, not re-drilled there — see _resolve_expr).
+        extra_struct_path = tuple(path[1:])
 
         located = self._branch_entries_for(final, top_key)
         if located is None:
@@ -135,59 +142,11 @@ class _Resolver:
 
         for i, branch, entry in matches:
             branch_tag = "" if n == 1 else f" [branch {i + 1}/{n}]"
-            branch_label = field_name + branch_tag
-
-            # Drill into STRUCT(...) sub-fields for a dotted path like
-            # "Address.City" — each remaining path segment must name a
-            # member of a STRUCT at that point. With a single branch this
-            # fails loudly (matches original behavior); with multiple
-            # branches a per-branch failure is reported as an unresolved
-            # branch instead of aborting the other branches.
-            expr = entry.expr
-            failed = False
-            for depth_i, part in enumerate(path[1:], start=1):
-                if not isinstance(expr, exp.Struct):
-                    reason = (
-                        f"'{'.'.join(path[:depth_i])}'{branch_tag} is not a "
-                        f"STRUCT, so sub-field '{part}' cannot be resolved"
-                    )
-                    if n == 1:
-                        raise StructFieldNotFoundError(field_name, reason)
-                    self.unresolved.append(reason)
-                    container.children.append(TraceNode(label=branch_label, kind="unresolved", detail=reason))
-                    failed = True
-                    break
-                match = next(
-                    (
-                        m
-                        for m in expr.expressions
-                        if isinstance(m, exp.PropertyEQ) and normalize_ident(m.name) == normalize_ident(part)
-                    ),
-                    None,
-                )
-                if match is None:
-                    available = sorted(
-                        m.name for m in expr.expressions if isinstance(m, exp.PropertyEQ)
-                    )
-                    reason = (
-                        f"no sub-field '{part}' in STRUCT{branch_tag}. "
-                        f"Available: {', '.join(available) or '<none>'}"
-                    )
-                    if n == 1:
-                        raise StructFieldNotFoundError(field_name, reason)
-                    self.unresolved.append(reason)
-                    container.children.append(TraceNode(label=branch_label, kind="unresolved", detail=reason))
-                    failed = True
-                    break
-                expr = match.expression
-            if failed:
-                continue
-
             branch_view = final.branch_view(i)
-            child = container if n == 1 else TraceNode(label=branch_label, kind="column")
+            child = container if n == 1 else TraceNode(label=field_name + branch_tag, kind="column")
             if n > 1:
                 container.children.append(child)
-            self._resolve_expr(expr, branch_view, child, visited=frozenset(), depth=0)
+            self._resolve_expr(entry.expr, branch_view, child, visited=frozenset(), depth=0, extra_struct_path=extra_struct_path)
 
         is_literal_only = len(self.tables) == 0 and len(self.unresolved) == 0
         return LineageResult(
@@ -210,15 +169,16 @@ class _Resolver:
         depth: int,
         extra_struct_path: tuple = (),
     ) -> None:
-        """``extra_struct_path`` carries a struct sub-field path left over
-        from an outer column reference that couldn't be drilled any further
-        at that hop (e.g. it addressed a native struct-typed *source*
-        column, not one of our own synthesized STRUCT(...) expressions) —
-        see ``_resolve_dep_column``. It's only meaningful for a Column node
+        """``extra_struct_path`` carries a requested struct sub-field path
+        (e.g. the ".City" in a top-level "Address.City" lookup, or a
+        leftover a Column reference couldn't drill into itself) down to
+        wherever it can actually be resolved. Column carries it further
         (appended to whatever struct_path that column reference has of its
-        own); every other expression type ignores it, since attaching the
-        same leftover suffix to e.g. every branch of a COALESCE wouldn't be
-        correct."""
+        own — see ``_resolve_column``); Struct drills into the named member
+        instead of fanning out to all of them; every other expression type
+        — a literal, NULL, or a function's scalar result — genuinely can't
+        satisfy it, so it's flagged as unresolved rather than silently
+        dropped or guessed."""
         if depth > MAX_DEPTH:
             reason = f"max recursion depth ({MAX_DEPTH}) exceeded — possible cycle"
             self.unresolved.append(reason)
@@ -233,6 +193,87 @@ class _Resolver:
             self._resolve_expr(node.this, ctx_stmt, parent, visited, depth, extra_struct_path)
             return
 
+        # Column and Struct both know how to handle extra_struct_path
+        # themselves (Column carries it further; Struct drills into the
+        # named member instead of fanning out to all of them) — dispatched
+        # first so the guard below only has to deal with node types that
+        # genuinely can never satisfy a requested sub-field path.
+        if isinstance(node, exp.Column):
+            self._resolve_column(node, ctx_stmt, parent, visited, depth, extra_struct_path)
+            return
+
+        if isinstance(node, exp.Struct):
+            # STRUCT(expr AS field, expr AS field, ...) — nested JSON object
+            # construction. sqlglot normalizes every member (explicitly
+            # aliased or not) to a PropertyEQ(name, expr).
+            if extra_struct_path:
+                # A specific sub-field was requested — either directly
+                # ("Address.City") or because chasing a plain column
+                # reference through one or more earlier dfs finally landed
+                # on the STRUCT(...) that actually defines it (e.g. the
+                # struct is built in df N-1 and just passed through whole,
+                # un-drilled, by the final SELECT). Drill into that one
+                # member instead of unioning the whole struct.
+                target = extra_struct_path[0]
+                match = next(
+                    (
+                        m
+                        for m in node.expressions
+                        if isinstance(m, exp.PropertyEQ) and normalize_ident(m.name) == normalize_ident(target)
+                    ),
+                    None,
+                )
+                if match is None:
+                    available = sorted(
+                        m.name for m in node.expressions if isinstance(m, exp.PropertyEQ)
+                    )
+                    reason = (
+                        f"no sub-field '{target}' in STRUCT in df '{ctx_stmt.name}'. "
+                        f"Available: {', '.join(available) or '<none>'}"
+                    )
+                    self.unresolved.append(reason)
+                    parent.children.append(TraceNode(label=target, kind="unresolved", detail=reason))
+                    return
+                field_node = TraceNode(label=match.name, kind="struct_field")
+                parent.children.append(field_node)
+                self._resolve_expr(
+                    match.expression, ctx_stmt, field_node, visited, depth + 1, extra_struct_path[1:]
+                )
+                return
+
+            # No specific sub-field requested — lineage for the struct as a
+            # whole is the union of every member's lineage.
+            struct_node = TraceNode(label="STRUCT(...)", kind="struct")
+            parent.children.append(struct_node)
+            for member in node.expressions:
+                if isinstance(member, exp.PropertyEQ):
+                    member_label = member.name
+                    member_expr = member.expression
+                else:
+                    # Defensive fallback — shouldn't occur with sqlglot's
+                    # normalization, but don't guess if it does.
+                    member_label = getattr(member, "alias_or_name", "") or "<unnamed>"
+                    member_expr = member
+                field_node = TraceNode(label=member_label, kind="struct_field")
+                struct_node.children.append(field_node)
+                self._resolve_expr(member_expr, ctx_stmt, field_node, visited, depth + 1)
+            return
+
+        if extra_struct_path:
+            # We've reached something that can never contain the requested
+            # sub-field path — a literal, NULL, or a function's scalar
+            # result. Flag it explicitly rather than silently dropping the
+            # requested specificity (falling through to resolve the whole
+            # expression) or guessing.
+            reason = (
+                f"cannot resolve sub-field path '{'.'.join(extra_struct_path)}' "
+                f"through a {type(node).__name__} expression in df "
+                f"'{ctx_stmt.name}': {node.sql()}"
+            )
+            self.unresolved.append(reason)
+            parent.children.append(TraceNode(label=node.sql(), kind="unresolved", detail=reason))
+            return
+
         if isinstance(node, exp.Null):
             parent.children.append(TraceNode(label="NULL", kind="null"))
             return
@@ -245,10 +286,6 @@ class _Resolver:
             kind = "literal"
             label = node.sql()
             parent.children.append(TraceNode(label=label, kind=kind))
-            return
-
-        if isinstance(node, exp.Column):
-            self._resolve_column(node, ctx_stmt, parent, visited, depth, extra_struct_path)
             return
 
         if isinstance(node, (exp.Coalesce, exp.Concat)):
@@ -309,27 +346,6 @@ class _Resolver:
                 self._resolve_expr(node.expression, ctx_stmt, fn_node, visited, depth + 1)
             if node.args.get("replacement") is not None:
                 self._resolve_expr(node.args["replacement"], ctx_stmt, fn_node, visited, depth + 1)
-            return
-
-        if isinstance(node, exp.Struct):
-            # STRUCT(expr AS field, expr AS field, ...) — nested JSON object
-            # construction. sqlglot normalizes every member (explicitly
-            # aliased or not) to a PropertyEQ(name, expr); lineage for the
-            # struct as a whole is the union of every member's lineage.
-            struct_node = TraceNode(label="STRUCT(...)", kind="struct")
-            parent.children.append(struct_node)
-            for member in node.expressions:
-                if isinstance(member, exp.PropertyEQ):
-                    member_label = member.name
-                    member_expr = member.expression
-                else:
-                    # Defensive fallback — shouldn't occur with sqlglot's
-                    # normalization, but don't guess if it does.
-                    member_label = getattr(member, "alias_or_name", "") or "<unnamed>"
-                    member_expr = member
-                field_node = TraceNode(label=member_label, kind="struct_field")
-                struct_node.children.append(field_node)
-                self._resolve_expr(member_expr, ctx_stmt, field_node, visited, depth + 1)
             return
 
         # Anything else (CASE, CAST, window funcs, subqueries, arbitrary
@@ -630,40 +646,17 @@ class _Resolver:
                 container.children.append(TraceNode(label=branch_label, kind="unresolved", detail=reason))
                 continue
 
-            # Drill the leftover struct sub-field path into the dependency's
-            # own expression, but only while it's actually one of our
-            # synthesized STRUCT(...) expressions — otherwise (a plain
-            # column, a native struct-typed source column, etc.) there's
-            # nothing more we can verify without schema info at this hop.
-            # Whatever wasn't consumed is carried forward as
-            # extra_struct_path so it still ends up appended to the
-            # eventual table.column qualifier rather than silently lost —
-            # e.g. a chain of plain pass-through columns
-            # (df2 = SELECT df1.item AS item FROM df1) reaching for
-            # alias.item.customerCode must not drop the ".customerCode".
-            expr = dep_entry.expr
-            consumed = 0
-            for part in struct_path:
-                if not isinstance(expr, exp.Struct):
-                    break
-                match = next(
-                    (
-                        m
-                        for m in expr.expressions
-                        if isinstance(m, exp.PropertyEQ) and normalize_ident(m.name) == normalize_ident(part)
-                    ),
-                    None,
-                )
-                if match is None:
-                    break
-                expr = match.expression
-                consumed += 1
-            leftover = tuple(struct_path[consumed:])
-
+            # Any struct sub-field path is handed to _resolve_expr as
+            # extra_struct_path — it drills in if dep_entry.expr turns out
+            # to be one of our own STRUCT(...) expressions, carries it
+            # further if dep_entry.expr is itself another column reference
+            # (a chain of plain pass-through columns, or a native
+            # struct-typed source column), or flags it if it reaches
+            # something that definitely can't contain it.
             child = TraceNode(label=f"{dep_stmt.name}.{dep_entry.alias}{branch_tag}", kind="column")
             container.children.append(child)
             branch_view = dep_stmt.branch_view(i)
-            self._resolve_expr(expr, branch_view, child, visited, depth + 1, leftover)
+            self._resolve_expr(dep_entry.expr, branch_view, child, visited, depth + 1, tuple(struct_path))
 
 
 def resolve_field_lineage(file_path: str, field_name: str) -> LineageResult:
