@@ -435,6 +435,49 @@ class _Resolver:
 
         self._resolve_dep_column(dep_stmt, col_name, struct_path, node_label, parent, visited | {dep_key}, depth)
 
+    def _resolve_star_all_sources(
+        self,
+        sources: list,
+        col_name: str,
+        struct_path: list,
+        dep_stmt_name: str,
+        node_label: str,
+        container: TraceNode,
+        visited: frozenset,
+        depth: int,
+    ) -> None:
+        """A bare ``SELECT *`` over 2+ FROM/JOIN sources — which one
+        actually provides a given column can't be known without table
+        schema information. Per explicit direction: rather than refuse to
+        resolve, include *every* source as a candidate table (clearly
+        flagged as an approximation, still counted as an unresolved branch)
+        so the false positives can be pruned by hand afterward."""
+        reason = (
+            f"'{node_label}': SELECT * over {len(sources)} FROM/JOIN sources in "
+            f"df '{dep_stmt_name}' — cannot determine which one actually provides "
+            f"'{col_name}' without table schema information, so all {len(sources)} "
+            f"are included as candidates; remove whichever don't actually have "
+            f"this column"
+        )
+        self.unresolved.append(reason)
+        star_node = TraceNode(
+            label=f"{node_label} (ambiguous SELECT * in '{dep_stmt_name}' — all sources included)",
+            kind="ambiguous",
+            detail=reason,
+        )
+        container.children.append(star_node)
+        for source in sources:
+            self._resolve_via_source(
+                source,
+                col_name,
+                struct_path,
+                dep_stmt_name,
+                f"candidate: {source.alias or source.ref_name}",
+                star_node,
+                visited,
+                depth + 1,
+            )
+
     def _resolve_dep_column(
         self,
         dep_stmt: DfStatement,
@@ -487,14 +530,16 @@ class _Resolver:
                         depth + 1,
                     )
                 else:
-                    reason = (
-                        f"df '{dep_stmt.name}' [branch 1/{n}] uses SELECT * over "
-                        f"{len(branches[0].sources)} FROM/JOIN sources — cannot "
-                        f"determine which one provides '{col_name}' without "
-                        f"table schema information"
+                    self._resolve_star_all_sources(
+                        branches[0].sources,
+                        col_name,
+                        struct_path,
+                        dep_stmt.name,
+                        branch0_label,
+                        container,
+                        visited,
+                        depth + 1,
                     )
-                    self.unresolved.append(reason)
-                    container.children.append(TraceNode(label=branch0_label, kind="unresolved", detail=reason))
                 for i in range(1, n):
                     reason = (
                         f"df '{dep_stmt.name}' [branch {i + 1}/{n}]: position of "
@@ -551,17 +596,21 @@ class _Resolver:
                             depth + 1,
                         )
                         continue
-                    reason = (
-                        f"df '{dep_stmt.name}'{branch_tag} uses SELECT * over "
-                        f"{len(branch.sources)} FROM/JOIN sources — cannot "
-                        f"determine which one provides '{col_name}' without "
-                        f"table schema information"
+                    self._resolve_star_all_sources(
+                        branch.sources,
+                        col_name,
+                        struct_path,
+                        dep_stmt.name,
+                        branch_label,
+                        container,
+                        visited,
+                        depth + 1,
                     )
-                else:
-                    reason = (
-                        f"column '{col_name}' is not an output column of df "
-                        f"'{dep_stmt.name}'{branch_tag}"
-                    )
+                    continue
+                reason = (
+                    f"column '{col_name}' is not an output column of df "
+                    f"'{dep_stmt.name}'{branch_tag}"
+                )
                 self.unresolved.append(reason)
                 container.children.append(TraceNode(label=branch_label, kind="unresolved", detail=reason))
                 continue
