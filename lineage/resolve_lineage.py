@@ -32,27 +32,47 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from lineage.cli import main as cli_main
 from lineage.errors import LineageError
 from lineage.lineage_resolver import resolve_field_lineage
-
+from lineage.field_descriptor import resolve_field_description
 # ---------------------------------------------------------------------------
 # Edit these and hit Run — used only when the script is launched with no
 # command-line arguments (e.g. from an IDE).
 # ---------------------------------------------------------------------------
-QUERY_FILE = "example_query.txt"
-FIELD_NAME = "ClaimId"
+QUERY_FOLDER = "queries"
+queries = os.listdir(QUERY_FOLDER)
+FIELDS = ["ClaimId"]
 # ---------------------------------------------------------------------------
 
 
-def run(query_file: str = QUERY_FILE, field_name: str = FIELD_NAME) -> None:
-    """Resolve one field and print the result as JSON (IDE / variables mode)."""
-    try:
-        result = resolve_field_lineage(query_file, field_name)
-    except LineageError as e:
-        print(json.dumps({"error": str(e)}, indent=2))
-        return
-    print(json.dumps(result.to_dict(), indent=2))
+lineage = []
+for field in FIELDS:
+    sources = []
+    accepted_queries = []
+    for query in queries:
+        try:
+            sources.extend(
+                resolve_field_lineage(
+                    QUERY_FOLDER + "\\" + query,
+                    field
+                ).to_dict().get("tables")
+            )
+            accepted_queries.append(query)
+        except:
+            pass
+    lineage.append(
+        {
+            "fieldName" : field,
+            "fieldDescription": resolve_field_description(
+                QUERY_FOLDER + "\\" + accepted_queries[0],
+                field
+            ),
+            "sources" : sources
+        }
+    )
+        
 
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        raise SystemExit(cli_main())
-    run()
+print(
+    json.dumps(
+        lineage,
+        indent=4
+    )
+)
