@@ -66,15 +66,15 @@ def resolve_source_field(field_name: str, queries_dir: str) -> tuple[list[Resolv
     A dotted (struct sub-field) path deserves special care here: the
     resolver itself never *raises* for a struct member that doesn't exist —
     it reports has_unresolved_branches instead (consistent with how every
-    other resolution difficulty is handled, see lineage_resolver.py). So a
+    other resolution difficulty is handled, see lineage_resolver.py). A
     file where the top-level wrapper alias exists but the specific nested
-    member doesn't would otherwise succeed here with zero tables and no
-    exception, silently contributing nothing while looking like a match —
-    the unresolved reasons are surfaced as diagnostics so that isn't
-    invisible. This does NOT discard tables that did resolve alongside an
-    unresolved reason (e.g. a multi-source SELECT * where every candidate
-    table is included but the branch still counts as unresolved) — those
-    are kept, just with the reason surfaced too.
+    member doesn't is treated the same as "this file doesn't define the
+    field at all" — routine (most files won't have any given field, let
+    alone a matching nested sub-field), only surfaced in aggregate if the
+    field resolves *nowhere*, not as a per-file warning. Only a file that
+    *did* resolve something (e.g. a multi-source SELECT * where every
+    candidate table is included, still flagged unresolved as a caveat) gets
+    a per-file diagnostic — that's the case actually worth a look.
     """
     results: list[ResolvedSource] = []
     not_found: list[str] = []
@@ -93,7 +93,20 @@ def resolve_source_field(field_name: str, queries_dir: str) -> tuple[list[Resolv
             problems.append(f"{fname}: {e}")
             continue
 
+        if not lineage_result.tables:
+            # Nothing resolved for this file at all — whether the
+            # top-level field is absent (would have raised
+            # FieldNotFoundError, handled above) or a dotted path's struct
+            # sub-field just doesn't exist in this file's version of it,
+            # from here it's indistinguishable from "doesn't have it" and
+            # just as routine — fold into not_found rather than warning
+            # about every file that (expectedly) lacks this field.
+            not_found.append(fname)
+            continue
+
         if lineage_result.has_unresolved_branches:
+            # Something DID resolve, but only partially/with caveats —
+            # worth surfacing, unlike a plain miss above.
             for reason in lineage_result.unresolved_reasons:
                 problems.append(f"{fname}: {reason}")
 
