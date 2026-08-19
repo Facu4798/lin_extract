@@ -240,6 +240,16 @@ class _Resolver:
                 self._resolve_expr(arg, ctx_stmt, fn_node, visited, depth + 1)
             return
 
+        if isinstance(node, exp.Cast):
+            # CAST(x AS type) / TRY_CAST(x AS type) — sqlglot's exp.TryCast
+            # subclasses exp.Cast, so this catches both. Only .this (the
+            # value being cast) matters for lineage; the target type doesn't
+            # change which table/column feeds it.
+            fn_node = TraceNode(label=node.sql(), kind="function")
+            parent.children.append(fn_node)
+            self._resolve_expr(node.this, ctx_stmt, fn_node, visited, depth + 1)
+            return
+
         if isinstance(node, exp.Trim):
             # TRIM(x) / LTRIM(x) / RTRIM(x) / TRIM(chars FROM x) — the value
             # being trimmed (.this) is what matters for lineage; .expression
