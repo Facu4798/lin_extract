@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import os
 
-from lineage.errors import LineageError
+from lineage.errors import FieldNotFoundError, LineageError
 from lineage.lineage_resolver import resolve_field_lineage
 from joins.models import NO_LITERAL, GoldenFieldSpec, ResolvedSource
 
@@ -46,22 +46,46 @@ def _split_qualified(qualified: str) -> tuple[str, str]:
     return ".".join(parts[:2]), ".".join(parts[2:])
 
 
-def resolve_source_field(field_name: str, queries_dir: str) -> list[ResolvedSource]:
+def resolve_source_field(field_name: str, queries_dir: str) -> tuple[list[ResolvedSource], list[str]]:
     """Resolve ``field_name`` against every query file in ``queries_dir``,
     keeping results from whichever file(s) actually define it (mirrors the
     "try each file, skip the ones that don't have it" pattern already used
     for batch resolution — see resolve_lineage.py's IDE-mode loop). Each hit
-    is tagged with the file it came from."""
+    is tagged with the file it came from.
+
+    Also returns a list of diagnostic strings, so a field that *looks* like
+    it should resolve but doesn't isn't a silent dead end: a
+    ``FieldNotFoundError`` from one file is routine (that file just doesn't
+    define this field, most files won't) and is only reported if the field
+    resolved nowhere at all; any *other* error (a parse failure, an
+    unresolved/ambiguous branch surfaced as an exception, etc.) is always
+    reported, even when the field did resolve elsewhere — it means that
+    file has a real problem, silently masked by the "try every file, skip
+    failures" pattern otherwise.
+    """
     results: list[ResolvedSource] = []
+    not_found: list[str] = []
+    problems: list[str] = []
+
     for fname in sorted(os.listdir(queries_dir)):
         path = os.path.join(queries_dir, fname)
         if not os.path.isfile(path):
             continue
         try:
             lineage_result = resolve_field_lineage(path, field_name)
-        except LineageError:
+        except FieldNotFoundError:
+            not_found.append(fname)
+            continue
+        except LineageError as e:
+            problems.append(f"{fname}: {e}")
             continue
         for qualified in sorted(lineage_result.tables):
             table, column = _split_qualified(qualified)
             results.append(ResolvedSource(table=table, column=column, query_file=fname))
-    return results
+
+    diagnostics = list(problems)
+    if not results and not_found:
+        diagnostics.append(
+            f"'{field_name}' not found as an output field in: {', '.join(not_found)}"
+        )
+    return results, diagnostics

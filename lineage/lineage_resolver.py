@@ -281,6 +281,21 @@ class _Resolver:
                 self._resolve_expr(node.expression, ctx_stmt, fn_node, visited, depth + 1)
             return
 
+        if isinstance(node, exp.Pad):
+            # LPAD(x, len[, fill]) / RPAD(x, len[, fill]) — the value being
+            # padded (.this) is what matters for lineage; .expression (the
+            # target length) and .fill_pattern (the pad string) are almost
+            # always literals but are resolved too in case either is ever a
+            # column, same treatment as TRIM's optional args.
+            fn_node = TraceNode(label=node.sql(), kind="function")
+            parent.children.append(fn_node)
+            self._resolve_expr(node.this, ctx_stmt, fn_node, visited, depth + 1)
+            if node.args.get("expression") is not None:
+                self._resolve_expr(node.expression, ctx_stmt, fn_node, visited, depth + 1)
+            if node.args.get("fill_pattern") is not None:
+                self._resolve_expr(node.args["fill_pattern"], ctx_stmt, fn_node, visited, depth + 1)
+            return
+
         if isinstance(node, exp.Struct):
             # STRUCT(expr AS field, expr AS field, ...) — nested JSON object
             # construction. sqlglot normalizes every member (explicitly

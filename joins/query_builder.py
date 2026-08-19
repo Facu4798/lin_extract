@@ -52,12 +52,21 @@ def build_query(golden_structure_path: str, queries_dir: str) -> BuildResult:
     for gname, spec in golden_structure.items():
         resolved[gname] = {}
         for sf in spec.source_fields:
-            hits = resolve_source_field(sf, queries_dir)
+            hits, diagnostics = resolve_source_field(sf, queries_dir)
             if not hits:
                 warnings.append(
                     f"golden field '{gname}': source field '{sf}' did not "
                     f"resolve in any query file under '{queries_dir}'"
                 )
+            # Surfaced unconditionally, even when hits is non-empty — a
+            # parse/resolution problem in one file doesn't stop other files
+            # from succeeding, but it's still worth knowing about; this is
+            # often exactly why a field that's "clearly in the queries"
+            # doesn't show up (e.g. a different df in that same file fails
+            # to parse, or the field isn't re-exposed by the *last*
+            # statement — see DESIGN.md FR4).
+            for d in diagnostics:
+                warnings.append(f"golden field '{gname}': source field '{sf}': {d}")
             resolved[gname][sf] = hits
 
     # -- infer join edges: for each golden field, one representative
