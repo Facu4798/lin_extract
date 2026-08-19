@@ -240,6 +240,19 @@ class _Resolver:
                 self._resolve_expr(arg, ctx_stmt, fn_node, visited, depth + 1)
             return
 
+        if isinstance(node, exp.Trim):
+            # TRIM(x) / LTRIM(x) / RTRIM(x) / TRIM(chars FROM x) — the value
+            # being trimmed (.this) is what matters for lineage; .expression
+            # (the optional trim-characters arg, e.g. TRIM(' ' FROM a.x)) is
+            # almost always a literal but is resolved too in case it's ever
+            # a column, same treatment as COALESCE/CONCAT args.
+            fn_node = TraceNode(label=node.sql(), kind="function")
+            parent.children.append(fn_node)
+            self._resolve_expr(node.this, ctx_stmt, fn_node, visited, depth + 1)
+            if node.expression is not None:
+                self._resolve_expr(node.expression, ctx_stmt, fn_node, visited, depth + 1)
+            return
+
         if isinstance(node, exp.Struct):
             # STRUCT(expr AS field, expr AS field, ...) — nested JSON object
             # construction. sqlglot normalizes every member (explicitly
