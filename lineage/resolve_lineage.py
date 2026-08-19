@@ -8,7 +8,7 @@ Two ways to run this:
 
 2. **From the command line** (see DESIGN.md FR8), e.g.:
 
-       python resolve_lineage.py --file <query_file.txt> --field <CosmosFieldName> [--format json|text]
+       python lineage/resolve_lineage.py --file <query_file.txt> --field <CosmosFieldName> [--format json|text]
 
    Passing any command-line arguments switches this script into CLI mode and
    the QUERY_FILE/FIELD_NAME variables below are ignored.
@@ -20,7 +20,14 @@ Also importable programmatically:
 """
 
 import json
+import os
 import sys
+
+# This file lives inside the `lineage` package but is meant to be run
+# directly (e.g. VSCode's Run button), which sets sys.path[0] to this file's
+# own directory rather than its parent. Add the parent directory so
+# `import lineage.xxx` below resolves regardless of how this is launched.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lineage.cli import main as cli_main
 from lineage.errors import LineageError
