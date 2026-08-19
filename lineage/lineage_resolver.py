@@ -64,47 +64,122 @@ class _Resolver:
         self.tables: set[str] = set()
         self.unresolved: list[str] = []
 
+    @staticmethod
+    def _branch_entries_for(stmt: DfStatement, key: str) -> list[tuple[int, "Branch | None", "ProjectionEntry | None"]] | None:
+        """Locate ``key`` as an output column of ``stmt`` and return one
+        (branch_index, branch, entry) triple per branch — entry/branch are
+        ``None`` for a branch that doesn't actually provide a value at that
+        position (e.g. a shorter branch, or one that's a bare ``SELECT *``).
+
+        Matches Spark's real UNION semantics: only the FIRST branch's
+        aliases name the result's columns — later branches are matched by
+        *position*, not by their own (possibly different, possibly absent)
+        aliases. Returns ``None`` if ``key`` isn't one of branch 0's output
+        aliases at all.
+        """
+        branch0 = stmt.branches[0]
+        position = None
+        for idx, entry in enumerate(branch0.projections.values()):
+            if normalize_ident(entry.alias) == normalize_ident(key):
+                position = idx
+                break
+        if position is None:
+            return None
+
+        results = []
+        for i, branch in enumerate(stmt.branches):
+            values = list(branch.projections.values())
+            if position < len(values):
+                results.append((i, branch, values[position]))
+            else:
+                results.append((i, branch, None))
+        return results
+
     def resolve_field(self, field_name: str) -> LineageResult:
         final = self.ctx.final
         path = field_name.split(".")
-        top_key = normalize_ident(path[0])
-        entry = final.projections.get(top_key)
-        if entry is None:
-            raise FieldNotFoundError(
-                field_name, [p.alias for p in final.projections.values()]
-            )
+        top_key = path[0]
 
-        # Drill into STRUCT(...) sub-fields for a dotted path like
-        # "Address.City" — each remaining path segment must name a member
-        # of a STRUCT at that point (edge case: STRUCT-typed Cosmos fields).
-        expr = entry.expr
-        for depth_i, part in enumerate(path[1:], start=1):
-            if not isinstance(expr, exp.Struct):
-                raise StructFieldNotFoundError(
-                    field_name,
-                    f"'{'.'.join(path[:depth_i])}' is not a STRUCT, "
-                    f"so sub-field '{part}' cannot be resolved",
-                )
-            match = next(
-                (
-                    m
-                    for m in expr.expressions
-                    if isinstance(m, exp.PropertyEQ) and normalize_ident(m.name) == normalize_ident(part)
-                ),
-                None,
-            )
-            if match is None:
-                available = sorted(
-                    m.name for m in expr.expressions if isinstance(m, exp.PropertyEQ)
-                )
-                raise StructFieldNotFoundError(
-                    field_name,
-                    f"no sub-field '{part}' in STRUCT. Available: {', '.join(available) or '<none>'}",
-                )
-            expr = match.expression
+        located = self._branch_entries_for(final, top_key)
+        if located is None:
+            available = [e.alias for e in final.branches[0].projections.values()]
+            raise FieldNotFoundError(field_name, available)
 
+        matches = [(i, b, e) for i, b, e in located if e is not None]
+
+        n = len(final.branches)
         trace = TraceNode(label=field_name, kind="field")
-        self._resolve_expr(expr, final, trace, visited=frozenset(), depth=0)
+        container = trace
+        if n > 1:
+            container = TraceNode(label=f"UNION ({final.name})", kind="union")
+            trace.children.append(container)
+            matched_indices = {i for i, _, _ in matches}
+            for i in range(n):
+                if i not in matched_indices:
+                    reason = (
+                        f"column '{top_key}' is not an output column of df "
+                        f"'{final.name}' [branch {i + 1}/{n}]"
+                    )
+                    self.unresolved.append(reason)
+                    container.children.append(
+                        TraceNode(label=f"{field_name} [branch {i + 1}/{n}]", kind="unresolved", detail=reason)
+                    )
+
+        for i, branch, entry in matches:
+            branch_tag = "" if n == 1 else f" [branch {i + 1}/{n}]"
+            branch_label = field_name + branch_tag
+
+            # Drill into STRUCT(...) sub-fields for a dotted path like
+            # "Address.City" — each remaining path segment must name a
+            # member of a STRUCT at that point. With a single branch this
+            # fails loudly (matches original behavior); with multiple
+            # branches a per-branch failure is reported as an unresolved
+            # branch instead of aborting the other branches.
+            expr = entry.expr
+            failed = False
+            for depth_i, part in enumerate(path[1:], start=1):
+                if not isinstance(expr, exp.Struct):
+                    reason = (
+                        f"'{'.'.join(path[:depth_i])}'{branch_tag} is not a "
+                        f"STRUCT, so sub-field '{part}' cannot be resolved"
+                    )
+                    if n == 1:
+                        raise StructFieldNotFoundError(field_name, reason)
+                    self.unresolved.append(reason)
+                    container.children.append(TraceNode(label=branch_label, kind="unresolved", detail=reason))
+                    failed = True
+                    break
+                match = next(
+                    (
+                        m
+                        for m in expr.expressions
+                        if isinstance(m, exp.PropertyEQ) and normalize_ident(m.name) == normalize_ident(part)
+                    ),
+                    None,
+                )
+                if match is None:
+                    available = sorted(
+                        m.name for m in expr.expressions if isinstance(m, exp.PropertyEQ)
+                    )
+                    reason = (
+                        f"no sub-field '{part}' in STRUCT{branch_tag}. "
+                        f"Available: {', '.join(available) or '<none>'}"
+                    )
+                    if n == 1:
+                        raise StructFieldNotFoundError(field_name, reason)
+                    self.unresolved.append(reason)
+                    container.children.append(TraceNode(label=branch_label, kind="unresolved", detail=reason))
+                    failed = True
+                    break
+                expr = match.expression
+            if failed:
+                continue
+
+            branch_view = final.branch_view(i)
+            child = container if n == 1 else TraceNode(label=branch_label, kind="column")
+            if n > 1:
+                container.children.append(child)
+            self._resolve_expr(expr, branch_view, child, visited=frozenset(), depth=0)
 
         is_literal_only = len(self.tables) == 0 and len(self.unresolved) == 0
         return LineageResult(
@@ -297,69 +372,121 @@ class _Resolver:
             parent.children.append(TraceNode(label=node_label, kind="unresolved", detail=reason))
             return
 
-        dep_entry = dep_stmt.projections.get(normalize_ident(col_name))
-        if dep_entry is None:
-            if dep_stmt.has_star:
-                # A bare SELECT * with exactly one FROM/JOIN source has no
-                # ambiguity about where any given column comes from — every
-                # column it exposes passes straight through from that one
-                # source, whatever it's named, so resolve directly into it
-                # (recursing further if that source is itself a df, possibly
-                # with its own SELECT *). With 2+ sources we can't tell which
-                # one actually has the column without schema info, so that
-                # case stays explicitly unresolved rather than guessing.
-                if len(dep_stmt.sources) == 1:
-                    passthrough_label = f"{node_label} (via SELECT * in '{dep_stmt.name}')"
-                    self._resolve_via_source(
-                        dep_stmt.sources[0],
-                        col_name,
-                        struct_path,
-                        dep_stmt.name,
-                        passthrough_label,
-                        parent,
-                        visited | {dep_key},
-                        depth + 1,
+        self._resolve_dep_column(dep_stmt, col_name, struct_path, node_label, parent, visited | {dep_key}, depth)
+
+    def _resolve_dep_column(
+        self,
+        dep_stmt: DfStatement,
+        col_name: str,
+        struct_path: list,
+        node_label: str,
+        parent: TraceNode,
+        visited: frozenset,
+        depth: int,
+    ) -> None:
+        """Resolve ``col_name`` as an output column of ``dep_stmt``, which
+        may have multiple UNION ALL branches (§ new: UNION support) — each
+        branch is resolved independently (own FROM/JOIN scope) and their
+        lineage is unioned, same treatment as COALESCE/CONCAT/STRUCT args.
+
+        With multiple branches, matching follows Spark's real UNION
+        semantics (only branch 0's aliases name the result — later branches
+        line up by *position*, not name); see ``_branch_entries_for``. With
+        exactly one branch this is just "look up col_name by name", same as
+        before UNION support existed.
+        """
+        branches = dep_stmt.branches
+        n = len(branches)
+
+        if n == 1:
+            located = [(0, branches[0], branches[0].projections.get(normalize_ident(col_name)))]
+        else:
+            found = self._branch_entries_for(dep_stmt, col_name)
+            if found is None:
+                reason = (
+                    f"df '{dep_stmt.name}' is a UNION whose first branch does not "
+                    f"define '{col_name}' as an output column (later branches are "
+                    f"matched by position, so it can't be located)"
+                )
+                self.unresolved.append(reason)
+                parent.children.append(TraceNode(label=node_label, kind="unresolved", detail=reason))
+                return
+            located = found
+
+        container = parent
+        if n > 1:
+            container = TraceNode(label=f"UNION ({dep_stmt.name})", kind="union")
+            parent.children.append(container)
+
+        for i, branch, dep_entry in located:
+            branch_tag = "" if n == 1 else f" [branch {i + 1}/{n}]"
+            branch_label = node_label + branch_tag
+
+            if dep_entry is None:
+                if branch.has_star:
+                    # A bare SELECT * with exactly one FROM/JOIN source has
+                    # no ambiguity about where any given column comes from
+                    # — every column it exposes passes straight through
+                    # from that one source, whatever it's named, so resolve
+                    # directly into it (recursing further if that source is
+                    # itself a df, possibly with its own SELECT *). With 2+
+                    # sources we can't tell which one actually has the
+                    # column without schema info, so that case stays
+                    # explicitly unresolved rather than guessing.
+                    if len(branch.sources) == 1:
+                        passthrough_label = f"{branch_label} (via SELECT * in '{dep_stmt.name}')"
+                        self._resolve_via_source(
+                            branch.sources[0],
+                            col_name,
+                            struct_path,
+                            dep_stmt.name,
+                            passthrough_label,
+                            container,
+                            visited,
+                            depth + 1,
+                        )
+                        continue
+                    reason = (
+                        f"df '{dep_stmt.name}'{branch_tag} uses SELECT * over "
+                        f"{len(branch.sources)} FROM/JOIN sources — cannot "
+                        f"determine which one provides '{col_name}' without "
+                        f"table schema information"
                     )
-                    return
-                reason = (
-                    f"df '{dep_stmt.name}' uses SELECT * over {len(dep_stmt.sources)} "
-                    f"FROM/JOIN sources — cannot determine which one provides "
-                    f"'{col_name}' without table schema information"
-                )
-            else:
-                reason = (
-                    f"column '{col_name}' is not an output column of df '{dep_stmt.name}'"
-                )
-            self.unresolved.append(reason)
-            parent.children.append(TraceNode(label=node_label, kind="unresolved", detail=reason))
-            return
+                else:
+                    reason = (
+                        f"column '{col_name}' is not an output column of df "
+                        f"'{dep_stmt.name}'{branch_tag}"
+                    )
+                self.unresolved.append(reason)
+                container.children.append(TraceNode(label=branch_label, kind="unresolved", detail=reason))
+                continue
 
-        # Drill the leftover struct sub-field path into the dependency's own
-        # expression, but only while it's actually one of our synthesized
-        # STRUCT(...) expressions — otherwise (a plain column, a native
-        # struct-typed source column, etc.) there's nothing more we can
-        # verify without schema info, so just resolve it as-is.
-        expr = dep_entry.expr
-        for part in struct_path:
-            if not isinstance(expr, exp.Struct):
-                break
-            match = next(
-                (
-                    m
-                    for m in expr.expressions
-                    if isinstance(m, exp.PropertyEQ) and normalize_ident(m.name) == normalize_ident(part)
-                ),
-                None,
-            )
-            if match is None:
-                break
-            expr = match.expression
+            # Drill the leftover struct sub-field path into the dependency's
+            # own expression, but only while it's actually one of our
+            # synthesized STRUCT(...) expressions — otherwise (a plain
+            # column, a native struct-typed source column, etc.) there's
+            # nothing more we can verify without schema info, so just
+            # resolve it as-is.
+            expr = dep_entry.expr
+            for part in struct_path:
+                if not isinstance(expr, exp.Struct):
+                    break
+                match = next(
+                    (
+                        m
+                        for m in expr.expressions
+                        if isinstance(m, exp.PropertyEQ) and normalize_ident(m.name) == normalize_ident(part)
+                    ),
+                    None,
+                )
+                if match is None:
+                    break
+                expr = match.expression
 
-        child = TraceNode(label=f"{dep_stmt.name}.{dep_entry.alias}", kind="column")
-        parent.children.append(child)
-        self._resolve_expr(
-            expr, dep_stmt, child, visited | {dep_key}, depth + 1
-        )
+            child = TraceNode(label=f"{dep_stmt.name}.{dep_entry.alias}{branch_tag}", kind="column")
+            container.children.append(child)
+            branch_view = dep_stmt.branch_view(i)
+            self._resolve_expr(expr, branch_view, child, visited, depth + 1)
 
 
 def resolve_field_lineage(file_path: str, field_name: str) -> LineageResult:

@@ -8,7 +8,7 @@ import sqlglot
 from sqlglot import exp
 
 from lineage.errors import SqlParseError
-from lineage.models import DfStatement, ProjectionEntry, SourceRef, normalize_ident
+from lineage.models import Branch, DfStatement, ProjectionEntry, SourceRef, normalize_ident
 
 # FR3: analytics_{sor_name}_cdz.{table_name} — two-part, dot-qualified, first
 # part matching analytics_[^.]+_cdz.
@@ -107,29 +107,44 @@ def _collect_projections(select: exp.Select) -> dict[str, ProjectionEntry]:
     return projections
 
 
+def _flatten_union(node: exp.Expression) -> list[exp.Expression]:
+    """Flatten a (possibly chained) UNION/UNION ALL tree into its leaf
+    SELECT statements, left to right. Union is left-associative in
+    sqlglot's AST, so a 3-way union nests as Union(Union(s1, s2), s3)."""
+    if isinstance(node, exp.Union):
+        return _flatten_union(node.this) + _flatten_union(node.expression)
+    return [node]
+
+
 def parse_statement(df_name: str, raw_sql: str, line_no: int, known_df_names: set[str]) -> DfStatement:
-    """Parse one df's raw SQL text into a :class:`DfStatement` (FR2)."""
+    """Parse one df's raw SQL text into a :class:`DfStatement` (FR2).
+
+    Supports ``SELECT ... UNION [ALL] SELECT ...`` (also DISTINCT/INTERSECT/
+    EXCEPT, which sqlglot parses the same way): each branch gets its own
+    independent FROM/JOIN scope and projections (see :class:`Branch`).
+    """
     try:
         parsed = sqlglot.parse_one(raw_sql, read=DIALECT)
     except Exception as e:  # sqlglot raises its own ParseError subclasses
         raise SqlParseError(df_name, line_no, str(e)) from e
 
-    if not isinstance(parsed, exp.Select):
+    selects = _flatten_union(parsed)
+    if not selects or not all(isinstance(s, exp.Select) for s in selects):
+        bad = next((s for s in selects if not isinstance(s, exp.Select)), parsed)
         raise SqlParseError(
             df_name,
             line_no,
-            f"expected a SELECT statement, got {type(parsed).__name__}",
+            f"expected a SELECT statement (optionally combined with UNION/"
+            f"UNION ALL), got {type(bad).__name__}",
         )
 
-    sources = _collect_sources(parsed, known_df_names)
-    projections = _collect_projections(parsed)
-    has_star = _has_star(parsed)
+    branches = [
+        Branch(
+            sources=_collect_sources(select, known_df_names),
+            projections=_collect_projections(select),
+            has_star=_has_star(select),
+        )
+        for select in selects
+    ]
 
-    return DfStatement(
-        name=df_name,
-        raw_sql=raw_sql,
-        line_no=line_no,
-        sources=sources,
-        projections=projections,
-        has_star=has_star,
-    )
+    return DfStatement(name=df_name, raw_sql=raw_sql, line_no=line_no, branches=branches)

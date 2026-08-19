@@ -135,6 +135,13 @@ def parse_file(text: str) -> list[tuple[str, str, int]]:
                     f"trailing '\\' was still expecting a continuation line."
                 )
             next_line = lines[i]
+            if next_line.strip() == "" and not in_single and not in_double:
+                # A blank line inside a continued statement (the previous
+                # line's trailing '\' already signaled more is coming) —
+                # skip it without ending the continuation. Only skip when
+                # not mid-string, since a blank line could conceivably be
+                # meaningful content inside an open string literal.
+                continue
             is_cont, in_single, in_double, cleaned = _ends_with_continuation(
                 next_line, in_single, in_double
             )

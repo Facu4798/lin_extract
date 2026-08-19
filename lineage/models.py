@@ -44,16 +44,56 @@ class ProjectionEntry:
 
 
 @dataclass
-class DfStatement:
-    """Parsed representation of one ``df_name = SELECT ...`` assignment."""
+class Branch:
+    """One SELECT's sources/projections. Normally a df has exactly one
+    branch; a ``SELECT ... UNION [ALL] SELECT ...`` df has one branch per
+    unioned SELECT, each with its own independent FROM/JOIN scope (aliases
+    in one branch have no relation to aliases in another)."""
 
-    name: str
-    raw_sql: str
-    line_no: int
     sources: list[SourceRef] = field(default_factory=list)
     # keyed by normalize_ident(alias) -> ProjectionEntry
     projections: dict[str, ProjectionEntry] = field(default_factory=dict)
     has_star: bool = False  # SELECT * (or t.*) present — FR/edge case #6
+
+
+@dataclass
+class DfStatement:
+    """Parsed representation of one ``df_name = SELECT ...`` assignment.
+
+    ``.sources``/``.projections``/``.has_star`` are convenience properties
+    delegating to the first branch, so all pre-UNION-support code (and
+    tests) that only ever dealt with a single branch keeps working
+    unchanged. Multi-branch (UNION) statements must go through
+    ``.branches``/``.branch_view()`` explicitly.
+    """
+
+    name: str
+    raw_sql: str
+    line_no: int
+    branches: list[Branch] = field(default_factory=lambda: [Branch()])
+
+    @property
+    def sources(self) -> list[SourceRef]:
+        return self.branches[0].sources
+
+    @property
+    def projections(self) -> dict[str, ProjectionEntry]:
+        return self.branches[0].projections
+
+    @property
+    def has_star(self) -> bool:
+        return self.branches[0].has_star
+
+    @property
+    def is_union(self) -> bool:
+        return len(self.branches) > 1
+
+    def branch_view(self, i: int) -> "DfStatement":
+        """A single-branch view of this statement: same name/raw_sql/
+        line_no, but exposing only branch ``i`` via .sources/.projections/
+        .has_star. Lets ordinary single-branch resolution logic operate on
+        one UNION branch at a time without modification."""
+        return DfStatement(self.name, self.raw_sql, self.line_no, [self.branches[i]])
 
 
 @dataclass
