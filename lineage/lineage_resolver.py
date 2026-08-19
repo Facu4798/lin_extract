@@ -65,6 +65,14 @@ class _Resolver:
         self.unresolved: list[str] = []
 
     @staticmethod
+    def _qualify_column(table_ref: str, col_name: str, struct_path: list) -> str:
+        """Build ``schema.table.column`` (or ``schema.table.column.sub.field``
+        when a struct sub-field path is involved) for the final resolved
+        leaf — this is what actually populates ``LineageResult.tables``."""
+        path = ".".join([col_name, *struct_path])
+        return f"{table_ref}.{path}"
+
+    @staticmethod
     def _branch_entries_for(stmt: DfStatement, key: str) -> list[tuple[int, "Branch | None", "ProjectionEntry | None"]] | None:
         """Locate ``key`` as an output column of ``stmt`` and return one
         (branch_index, branch, entry) triple per branch — entry/branch are
@@ -200,7 +208,17 @@ class _Resolver:
         parent: TraceNode,
         visited: frozenset,
         depth: int,
+        extra_struct_path: tuple = (),
     ) -> None:
+        """``extra_struct_path`` carries a struct sub-field path left over
+        from an outer column reference that couldn't be drilled any further
+        at that hop (e.g. it addressed a native struct-typed *source*
+        column, not one of our own synthesized STRUCT(...) expressions) —
+        see ``_resolve_dep_column``. It's only meaningful for a Column node
+        (appended to whatever struct_path that column reference has of its
+        own); every other expression type ignores it, since attaching the
+        same leftover suffix to e.g. every branch of a COALESCE wouldn't be
+        correct."""
         if depth > MAX_DEPTH:
             reason = f"max recursion depth ({MAX_DEPTH}) exceeded — possible cycle"
             self.unresolved.append(reason)
@@ -209,10 +227,10 @@ class _Resolver:
 
         # transparent unwrap: parens / redundant alias nesting
         if isinstance(node, exp.Paren):
-            self._resolve_expr(node.this, ctx_stmt, parent, visited, depth)
+            self._resolve_expr(node.this, ctx_stmt, parent, visited, depth, extra_struct_path)
             return
         if isinstance(node, exp.Alias):
-            self._resolve_expr(node.this, ctx_stmt, parent, visited, depth)
+            self._resolve_expr(node.this, ctx_stmt, parent, visited, depth, extra_struct_path)
             return
 
         if isinstance(node, exp.Null):
@@ -230,7 +248,7 @@ class _Resolver:
             return
 
         if isinstance(node, exp.Column):
-            self._resolve_column(node, ctx_stmt, parent, visited, depth)
+            self._resolve_column(node, ctx_stmt, parent, visited, depth, extra_struct_path)
             return
 
         if isinstance(node, (exp.Coalesce, exp.Concat)):
@@ -303,6 +321,7 @@ class _Resolver:
         parent: TraceNode,
         visited: frozenset,
         depth: int,
+        extra_struct_path: tuple = (),
     ) -> None:
         # col.parts gives every dot-separated identifier left-to-right. For
         # 3+ parts (e.g. "df_item_0.item.customerCode"), this is Spark's
@@ -312,18 +331,21 @@ class _Resolver:
         # nested value is read — it doesn't change which table/column feeds
         # it, so it's carried through for the trace but not required to
         # resolve further (we drill into it only if it turns out to
-        # address one of our own STRUCT(...) expressions).
+        # address one of our own STRUCT(...) expressions). Any leftover
+        # struct_path from an *outer* column reference this one is standing
+        # in for (extra_struct_path — see _resolve_expr) is appended after
+        # this column's own path segments.
         parts = [p.name for p in col.parts]
         col_sql = col.sql()
 
         if len(parts) >= 2:
             table_part = parts[0]
             col_name = parts[1]
-            struct_path = parts[2:]
+            struct_path = parts[2:] + list(extra_struct_path)
         else:
             table_part = ""
             col_name = parts[0]
-            struct_path = []
+            struct_path = list(extra_struct_path)
 
         if table_part:
             matches = [s for s in ctx_stmt.sources if normalize_ident(s.alias) == normalize_ident(table_part)]
@@ -376,8 +398,9 @@ class _Resolver:
             return
 
         if source.is_real_table:
-            self.tables.add(source.ref_name)
-            parent.children.append(TraceNode(label=node_label, kind="table", detail=source.ref_name))
+            qualified = self._qualify_column(source.ref_name, col_name, struct_path)
+            self.tables.add(qualified)
+            parent.children.append(TraceNode(label=node_label, kind="table", detail=qualified))
             return
 
         # source is another df in the chain — recurse (§3.3(b), edge case #4)
@@ -532,9 +555,15 @@ class _Resolver:
             # own expression, but only while it's actually one of our
             # synthesized STRUCT(...) expressions — otherwise (a plain
             # column, a native struct-typed source column, etc.) there's
-            # nothing more we can verify without schema info, so just
-            # resolve it as-is.
+            # nothing more we can verify without schema info at this hop.
+            # Whatever wasn't consumed is carried forward as
+            # extra_struct_path so it still ends up appended to the
+            # eventual table.column qualifier rather than silently lost —
+            # e.g. a chain of plain pass-through columns
+            # (df2 = SELECT df1.item AS item FROM df1) reaching for
+            # alias.item.customerCode must not drop the ".customerCode".
             expr = dep_entry.expr
+            consumed = 0
             for part in struct_path:
                 if not isinstance(expr, exp.Struct):
                     break
@@ -549,11 +578,13 @@ class _Resolver:
                 if match is None:
                     break
                 expr = match.expression
+                consumed += 1
+            leftover = tuple(struct_path[consumed:])
 
             child = TraceNode(label=f"{dep_stmt.name}.{dep_entry.alias}{branch_tag}", kind="column")
             container.children.append(child)
             branch_view = dep_stmt.branch_view(i)
-            self._resolve_expr(expr, branch_view, child, visited, depth + 1)
+            self._resolve_expr(expr, branch_view, child, visited, depth + 1, leftover)
 
 
 def resolve_field_lineage(file_path: str, field_name: str) -> LineageResult:

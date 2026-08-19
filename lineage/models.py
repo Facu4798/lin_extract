@@ -119,6 +119,9 @@ class LineageResult:
     """Result of resolving one Cosmos field's lineage (FR7)."""
 
     field: str
+    # Fully-qualified analytics_{sor}_cdz.{table}.{column} strings (a struct
+    # sub-field path is appended, e.g. "...table.item.customerCode", when
+    # relevant) — one per resolved real-table leaf, deduplicated.
     tables: set[str]
     is_literal_only: bool
     has_unresolved_branches: bool
