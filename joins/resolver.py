@@ -62,6 +62,19 @@ def resolve_source_field(field_name: str, queries_dir: str) -> tuple[list[Resolv
     reported, even when the field did resolve elsewhere — it means that
     file has a real problem, silently masked by the "try every file, skip
     failures" pattern otherwise.
+
+    A dotted (struct sub-field) path deserves special care here: the
+    resolver itself never *raises* for a struct member that doesn't exist —
+    it reports has_unresolved_branches instead (consistent with how every
+    other resolution difficulty is handled, see lineage_resolver.py). So a
+    file where the top-level wrapper alias exists but the specific nested
+    member doesn't would otherwise succeed here with zero tables and no
+    exception, silently contributing nothing while looking like a match —
+    the unresolved reasons are surfaced as diagnostics so that isn't
+    invisible. This does NOT discard tables that did resolve alongside an
+    unresolved reason (e.g. a multi-source SELECT * where every candidate
+    table is included but the branch still counts as unresolved) — those
+    are kept, just with the reason surfaced too.
     """
     results: list[ResolvedSource] = []
     not_found: list[str] = []
@@ -79,6 +92,11 @@ def resolve_source_field(field_name: str, queries_dir: str) -> tuple[list[Resolv
         except LineageError as e:
             problems.append(f"{fname}: {e}")
             continue
+
+        if lineage_result.has_unresolved_branches:
+            for reason in lineage_result.unresolved_reasons:
+                problems.append(f"{fname}: {reason}")
+
         for qualified in sorted(lineage_result.tables):
             table, column = _split_qualified(qualified)
             results.append(ResolvedSource(table=table, column=column, query_file=fname))
