@@ -71,6 +71,21 @@ ambiguous-star handling) can be dropped with ``exclude_sources``: pass a
 path to a JSON exclude-list file, or a collection of exclusion strings
 directly (see ``joins.exclusions``). Excluded candidates are removed
 *before* any join-key inference runs.
+
+**Deduplication.** The FULL OUTER JOINs above are deliberately row-
+preserving, not row-collapsing — a non-1:1 join anywhere in the chain
+(an ambiguous ``SELECT *`` candidate, a loose bridge, ...) can still
+leave more than one row per real-world entity. Pass ``dedup_partition_by``
+(golden field names identifying the entity, e.g. ``["nationalId"]``) and
+``dedup_order_by`` (golden field names to break ties by, each optionally
+suffixed with ``"ASC"``/``"DESC"``, e.g. ``["updatedAt DESC"]``) to keep
+exactly one row per partition — implemented as
+``ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) = 1`` in one final
+wrapping CTE. Both must be given together (a partition with no
+deterministic order has no principled way to pick which row survives);
+every field named in either must be one of the golden fields that
+actually made it into the result, or ``build_query`` raises ``ValueError``
+rather than silently ignoring a typo.
 """
 
 from __future__ import annotations
@@ -182,6 +197,8 @@ def build_query(
     queries_dir: str,
     patch_missing_joins: bool = True,
     exclude_sources: "str | set[str] | list[str] | None" = None,
+    dedup_partition_by: "list[str] | None" = None,
+    dedup_order_by: "list[str] | None" = None,
 ) -> BuildResult:
     golden_structure = load_golden_structure(golden_structure_path)
     warnings: list[str] = []
@@ -311,7 +328,11 @@ def build_query(
             # Literal-only (either no source fields at all, or none of them
             # resolved) — not tied to any row, so it needs no join; folded
             # into the final SELECT once the entity is assembled below.
-            pending_literal_selects[gname] = _select_item(args, gname)
+            # args is always exactly [literal] here: this_tables empty means
+            # no hits contributed to seen_refs, and `if not args` above
+            # already ruled out zero args, so has_literal must be the sole
+            # contributor.
+            pending_literal_selects[gname] = args[0]
             continue
 
         # -- this field's own self-contained FROM/JOIN --------------------
@@ -473,16 +494,78 @@ def build_query(
         entity_tables = entity_tables | this_tables
         entity_gnames = entity_gnames + [gname]
 
-    # -- final SELECT, in golden_record_structure.json's own field order --
+    # -- final field expressions, in golden_record_structure.json's own
+    # field order (bare, not yet aliased — dedup below needs the raw
+    # expressions to reference in PARTITION BY/ORDER BY) -------------------
     entity_gname_set = set(entity_gnames)
-    select_lines: list[str] = []
+    field_exprs: dict[str, str] = {}
     for gname in golden_structure:
         if gname in pending_literal_selects:
-            select_lines.append(pending_literal_selects[gname])
+            field_exprs[gname] = pending_literal_selects[gname]
         elif gname in entity_gname_set:
-            select_lines.append(f"{entity_name}.{gname} AS {gname}")
+            field_exprs[gname] = f"{entity_name}.{gname}"
         # else: already warned about (nothing resolved, or couldn't connect)
 
+    if dedup_partition_by or dedup_order_by:
+        if entity_name is None:
+            raise ValueError(
+                "dedup_partition_by/dedup_order_by need at least one "
+                "resolved, table-backed golden field to dedup rows of — "
+                "nothing here is tied to any row"
+            )
+        if not dedup_partition_by or not dedup_order_by:
+            raise ValueError(
+                "dedup requires both dedup_partition_by and dedup_order_by "
+                "— a partition alone has no deterministic way to pick "
+                "which row survives"
+            )
+
+        available = set(field_exprs.keys())
+        unknown_partition = [f for f in dedup_partition_by if f not in available]
+        if unknown_partition:
+            raise ValueError(
+                f"dedup_partition_by references field(s) not present in "
+                f"the final result: {', '.join(unknown_partition)} "
+                f"(available: {', '.join(sorted(available))})"
+            )
+
+        order_parts: list[str] = []
+        for entry in dedup_order_by:
+            field, _, direction = entry.strip().partition(" ")
+            direction = direction.strip().upper() or "ASC"
+            if field not in available:
+                raise ValueError(
+                    f"dedup_order_by references field '{field}' not "
+                    f"present in the final result (available: "
+                    f"{', '.join(sorted(available))})"
+                )
+            if direction not in ("ASC", "DESC"):
+                raise ValueError(
+                    f"dedup_order_by: invalid direction '{direction}' for "
+                    f"field '{field}' — use 'ASC' or 'DESC'"
+                )
+            order_parts.append(f"{field_exprs[field]} {direction}")
+
+        partition_parts = [field_exprs[f] for f in dedup_partition_by]
+
+        ranked_select = [f"{expr} AS {gname}" for gname, expr in field_exprs.items()]
+        ranked_select.append(
+            "ROW_NUMBER() OVER (\n"
+            "        PARTITION BY " + ", ".join(partition_parts) + "\n"
+            "        ORDER BY " + ", ".join(order_parts) + "\n"
+            "    ) AS _dedup_row_number"
+        )
+        ranked_sql = "SELECT\n    " + ",\n    ".join(ranked_select) + f"\nFROM {entity_name}"
+        ranked_name = f"cte_{next(cte_seq)}_ranked"
+        ctes.append(f"{ranked_name} AS (\n{ranked_sql}\n)")
+
+        select_clause = "SELECT\n    " + ",\n    ".join(field_exprs.keys())
+        with_clause = "WITH " + ",\n".join(ctes)
+        sql = f"{with_clause}\n{select_clause}\nFROM {ranked_name}\nWHERE _dedup_row_number = 1"
+        return BuildResult(sql=sql, warnings=warnings)
+
+    # -- no dedup requested: plain final SELECT off the entity -------------
+    select_lines = [f"{expr} AS {gname}" for gname, expr in field_exprs.items()]
     select_clause = "SELECT\n    " + (",\n    ".join(select_lines) if select_lines else "-- nothing resolved")
 
     if entity_name is None:

@@ -26,10 +26,23 @@ QUERIES_DIR = "queries"
 # inference — e.g. ["analytics_x_cdz.t2.name"] or, to scope it to one
 # query file, ["analytics_x_cdz.t2.name&life.txt"]. Leave as None to skip.
 EXCLUDE_SOURCES_FILE = None
+# Golden field names to dedup the final result on — one row per distinct
+# combination of these survives, chosen by DEDUP_ORDER_BY. Both must be
+# set together, or left as None/[] to skip deduping entirely.
+DEDUP_PARTITION_BY = None  # e.g. ["nationalId"]
+# Golden field names to break dedup ties by; each entry may end in " ASC"
+# or " DESC" (default ASC if omitted) — e.g. ["updatedAt DESC"].
+DEDUP_ORDER_BY = None
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    result = build_query(GOLDEN_STRUCTURE_FILE, QUERIES_DIR, exclude_sources=EXCLUDE_SOURCES_FILE)
+    result = build_query(
+        GOLDEN_STRUCTURE_FILE,
+        QUERIES_DIR,
+        exclude_sources=EXCLUDE_SOURCES_FILE,
+        dedup_partition_by=DEDUP_PARTITION_BY,
+        dedup_order_by=DEDUP_ORDER_BY,
+    )
 
     print(result.sql)
 
