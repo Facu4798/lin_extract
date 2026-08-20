@@ -15,11 +15,24 @@ CTE:
   the entity's first column, plus a "connector" column for every table
   it touched (see below).
 - Every later golden field is ALSO built as its own self-contained CTE
-  first, then connected back onto the growing entity via a LEFT JOIN,
-  using whichever physical table(s) the two happen to share. If a
+  first, then connected back onto the growing entity via a FULL OUTER
+  JOIN, using whichever physical table(s) the two happen to share. If a
   field's own tables were never touched by any earlier field,
   ``build_query`` tries to *bridge* them together (see below) before
   giving up on it.
+
+Every join that combines real source data — a field's own internal
+multi-table join, and every entity-merge join, direct or bridged — is a
+FULL OUTER JOIN, not a LEFT JOIN: an entity that only exists in the
+*second*-listed source table of a coalesce (or only in a *later* golden
+field's tables) would otherwise be silently dropped just because it's
+missing from whichever table happened to be listed/processed first.
+``COALESCE`` still picks a value from whichever side actually has one;
+FULL OUTER JOIN just makes sure the *row* survives regardless of which
+side that turns out to be. (The bridge lookup CTE's own internal joins
+are the one exception — an unmatched hop there means "no known
+relationship for this particular row", which correctly excludes it from
+the *mapping*, not from any real entity.)
 
 **Connector columns.** The first golden field to touch a physical table T
 decides T's "identity" for every later field: whatever raw column T
@@ -37,9 +50,9 @@ an ambiguous/fan-out-prone join in one field can no longer compound with
 an unrelated join in another field the way a single flat FROM/JOIN would.
 It does **not** eliminate fan-out *within* one field's own CTE — if that
 field's own join isn't 1:1, its CTE can still produce more than one row
-per entity, and that duplication still propagates through the LEFT JOIN
-used to fold it into the entity. Use ``exclude_sources`` (below) to drop
-a candidate you know is causing that.
+per entity, and that duplication still propagates through the join used
+to fold it into the entity. Use ``exclude_sources`` (below) to drop a
+candidate you know is causing that.
 
 **Bridging.** When a golden field's tables share nothing with any earlier
 field, ``build_query`` scans every query file for any direct
@@ -93,11 +106,11 @@ def _safe_ident(name: str) -> str:
     return safe or "field"
 
 
-def _format_join(table: str, alias: str, conditions: list[str], keyword: str = "LEFT JOIN") -> str:
+def _format_join(table: str, alias: str, conditions: list[str], keyword: str) -> str:
     """Render one JOIN with each ON/AND condition on its own indented
     line, e.g.::
 
-        LEFT JOIN table2 AS alias2
+        FULL OUTER JOIN table2 AS alias2
             ON table1.column = table2.column
             AND table1.column = table2.column
     """
@@ -318,7 +331,7 @@ def build_query(
                     if other in local_joined:
                         continue
                     on_parts = [f"{a.sql_ref} = {b.sql_ref}" for a, b in conditions]
-                    from_lines.append(_format_join(other, _table_alias(other), on_parts))
+                    from_lines.append(_format_join(other, _table_alias(other), on_parts, keyword="FULL OUTER JOIN"))
                     local_joined.add(other)
                     next_frontier.append(other)
             frontier = next_frontier
@@ -441,15 +454,15 @@ def build_query(
 
         if shared:
             on_parts = [f"{entity_name}.{_connector_alias(t)} = {cte_name}.{_connector_alias(t)}" for t in sorted(shared)]
-            join_lines = [f"LEFT JOIN {cte_name}"]
+            join_lines = [f"FULL OUTER JOIN {cte_name}"]
             for i, cond in enumerate(on_parts):
                 join_lines.append(f"    {'ON' if i == 0 else 'OR'} {cond}")
             merged_from = [f"FROM {entity_name}", "\n".join(join_lines)]
         else:
             merged_from = [
                 f"FROM {entity_name}",
-                f"LEFT JOIN {bridge_cte_name}\n    ON {entity_name}.{_connector_alias(bridge_start_table)} = {bridge_cte_name}.entity_side_key",
-                f"LEFT JOIN {cte_name}\n    ON {bridge_cte_name}.field_side_key = {cte_name}.{_connector_alias(bridge_target_table)}",
+                f"FULL OUTER JOIN {bridge_cte_name}\n    ON {entity_name}.{_connector_alias(bridge_start_table)} = {bridge_cte_name}.entity_side_key",
+                f"FULL OUTER JOIN {cte_name}\n    ON {bridge_cte_name}.field_side_key = {cte_name}.{_connector_alias(bridge_target_table)}",
             ]
 
         merged_sql = "SELECT\n    " + ",\n    ".join(merged_select) + "\n" + "\n".join(merged_from)
