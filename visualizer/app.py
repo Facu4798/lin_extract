@@ -60,6 +60,10 @@ FONT_FIELD = ("Segoe UI", 9, "bold")
 FONT_DESC = ("Segoe UI", 8)
 
 
+field_column = "field"
+description_column = "description"
+
+
 def load_tables(tables_dir: Path) -> dict[str, list[dict[str, str]]]:
     """Read every CSV in ``tables_dir`` and keep the field/description rows.
 
@@ -80,7 +84,7 @@ def load_tables(tables_dir: Path) -> dict[str, list[dict[str, str]]]:
             continue
 
         df.columns = [str(c).strip().lower() for c in df.columns]
-        if "field" not in df.columns or "description" not in df.columns:
+        if field_column not in df.columns or description_column not in df.columns:
             print(
                 f"warning: {csv_path.name} is missing 'field'/'description' "
                 f"columns, skipping (found: {list(df.columns)})"
@@ -89,15 +93,15 @@ def load_tables(tables_dir: Path) -> dict[str, list[dict[str, str]]]:
 
         rows = []
         for _, row in df.iterrows():
-            field = str(row["field"]).strip() if pd.notna(row["field"]) else ""
+            field = str(row[field_column]).strip() if pd.notna(row[field_column]) else ""
             desc = (
-                str(row["description"]).strip()
-                if pd.notna(row["description"])
+                str(row[description_column]).strip()
+                if pd.notna(row[description_column])
                 else ""
             )
             if not field:
                 continue
-            rows.append({"field": field, "description": desc})
+            rows.append({field_column: field, description_column: desc})
 
         tables[csv_path.name] = rows
 
@@ -193,7 +197,7 @@ class TableBox:
         self.y = y
         self.width = TABLE_WIDTH
         self.rows: list[Row] = [
-            Row(self, i, r["field"], r["description"]) for i, r in enumerate(rows)
+            Row(self, i, r[field_column], r[description_column]) for i, r in enumerate(rows)
         ]
         self.height = HEADER_HEIGHT + len(self.rows) * ROW_HEIGHT
         self._header_rect_id: int | None = None
@@ -216,7 +220,7 @@ class TableBox:
             self.x, self.y, self.x + self.width, self.y + HEADER_HEIGHT,
             fill=COLOR_HEADER_BG, outline=COLOR_TABLE_OUTLINE, tags=(tag, "header"),
         )
-        c.create_text(
+        header_text_id = c.create_text(
             self.x + self.width / 2, self.y + HEADER_HEIGHT / 2,
             text=self.name, fill=COLOR_HEADER_FG, font=FONT_HEADER,
             tags=(tag, "header"),
@@ -225,7 +229,10 @@ class TableBox:
         for row in self.rows:
             self._draw_row(row)
 
-        for item in c.find_withtag("header"):
+        # Bind only this table's own header items -- find_withtag("header")
+        # would match every table's header (the tag isn't table-specific)
+        # and rebind earlier tables' headers to drag this one instead.
+        for item in (self._header_rect_id, header_text_id):
             c.tag_bind(item, "<ButtonPress-1>", self._on_drag_start)
             c.tag_bind(item, "<B1-Motion>", self._on_drag_move)
             c.tag_bind(item, "<ButtonRelease-1>", self._on_drag_end)
