@@ -36,6 +36,10 @@ BASE_DIR = Path(__file__).resolve().parent
 TABLES_DIR = BASE_DIR / "tables"
 STATE_FILE = BASE_DIR / "connections.json"
 
+field_column = "field"
+description_column = "description"
+
+
 ROW_HEIGHT = 24
 HEADER_HEIGHT = 28
 TABLE_WIDTH = 260
@@ -59,9 +63,6 @@ FONT_HEADER = ("Segoe UI", 10, "bold")
 FONT_FIELD = ("Segoe UI", 9, "bold")
 FONT_DESC = ("Segoe UI", 8)
 
-
-field_column = "field"
-description_column = "description"
 
 
 def load_tables(tables_dir: Path) -> dict[str, list[dict[str, str]]]:
@@ -280,6 +281,9 @@ class TableBox:
     def redraw_row(self, row: Row) -> None:
         self.canvas.delete(f"row_{self.name}_{row.index}")
         self._draw_row(row)
+        # Recreated row items land on top of the stack; keep connection
+        # lines above rows/tables regardless of redraw order.
+        self.canvas.tag_raise("connection")
 
     # -- dragging ------------------------------------------------------
     def _on_drag_start(self, event) -> None:
@@ -557,7 +561,7 @@ class App:
             *self._connection_points(a, b),
             smooth=True, fill=color, width=2, tags=("connection",),
         )
-        self.canvas.tag_lower(line_id, "row")
+        self.canvas.tag_raise(line_id)
         self.canvas.tag_bind(line_id, "<Button-3>", lambda e, k=key: self._on_connection_right_click(e, k))
         self.canvas.tag_bind(line_id, "<Enter>", lambda e, i=line_id: self.canvas.itemconfig(i, fill=COLOR_LINE_HOVER))
         self.canvas.tag_bind(
