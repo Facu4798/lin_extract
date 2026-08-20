@@ -1,54 +1,75 @@
-"""Build a single golden-record SQL query from a golden_record_structure.json
-and a folder of per-collection query files.
+"""Build a golden-record SQL query, one CTE per golden field, from a
+golden_record_structure.json and a folder of per-collection query files.
 
-Two things this deliberately does NOT try to be clever about (ask rather
-than guess, same policy as the ``lineage`` package):
+Instead of merging every golden field's join keys into one flat FROM/JOIN
+chain (which risks compounding unrelated fields' fan-outs into one
+multiplied row set — field A's join fanning out 2x and field B's fanning
+out 3x used to combine into up to 6x, even though neither field's own
+join is individually that bad), each golden field is built in its own
+CTE first, self-contained, and only then folded into a growing "entity"
+CTE:
 
-- **Join keys.** For now (per explicit direction), two source tables are
-  only known to be joinable when some golden field coalesces a column from
-  each of them — that field's own pair of source columns becomes the join
-  condition. When one side of that pairing is itself ambiguous (a source
-  field that resolved to 2+ candidate columns, e.g. from a multi-source
-  ``SELECT *``), every candidate table gets its own *independent* join
-  against the other side, rather than picking one or refusing to join at
-  all — equivalent to "whichever candidate actually matches wins", since
-  each candidate's condition is separate and unmatched ones just stay NULL.
-  A table that never shares a golden field with any other table at all
-  has no inferable join key from golden fields alone. Before giving up on
-  it, ``build_query`` tries one more thing: it scans every query file for
-  *any* direct ``real_table JOIN real_table ON a.x = b.y`` condition
-  (regardless of whether that field is part of the golden record at all)
-  and, if one connects the orphaned table back to the rest of the query
-  (possibly by pulling in further tables purely as bridges, not selected
-  from), patches it in as a LEFT JOIN — flagged with a warning either way,
-  since it wasn't derived from a golden field and deserves a look. Only if
-  no such join can be found anywhere is the table left out entirely (still
-  warned about). Set ``patch_missing_joins=False`` to disable this and get
-  the old strict behavior.
-- **Join type.** Every join defaults to LEFT (anchored on the first table
-  encountered), since that's the only choice that can never drop a row a
-  coalesce might still want data from. If you need a specific join to be
-  INNER instead, treat this as a first draft to hand-edit, not a final
-  query — the generated SQL is meant to save the mechanical part, not
-  replace review.
+- The first golden field with any resolved source tables becomes the
+  entity's anchor: its own join (shared source tables within *that one
+  field's* own coalesce list only — same inference as before) produces
+  the entity's first column, plus a "connector" column for every table
+  it touched (see below).
+- Every later golden field is ALSO built as its own self-contained CTE
+  first, then connected back onto the growing entity via a LEFT JOIN,
+  using whichever physical table(s) the two happen to share. If a
+  field's own tables were never touched by any earlier field,
+  ``build_query`` tries to *bridge* them together (see below) before
+  giving up on it.
+
+**Connector columns.** The first golden field to touch a physical table T
+decides T's "identity" for every later field: whatever raw column T
+contributed to *that* field's own coalesce becomes T's canonical
+connector column from then on — every later CTE that also touches T
+re-exposes that same column (not necessarily the one it actually
+coalesces) purely so it can be joined back to the entity by it. This
+means **field order in golden_record_structure.json matters**: put your
+most trustworthy/unique field first (e.g. a national ID) so it becomes
+the key every other field links against, rather than a field whose match
+logic is looser (e.g. a name).
+
+This scopes each field's own join graph to only the tables *it* needs, so
+an ambiguous/fan-out-prone join in one field can no longer compound with
+an unrelated join in another field the way a single flat FROM/JOIN would.
+It does **not** eliminate fan-out *within* one field's own CTE — if that
+field's own join isn't 1:1, its CTE can still produce more than one row
+per entity, and that duplication still propagates through the LEFT JOIN
+used to fold it into the entity. Use ``exclude_sources`` (below) to drop
+a candidate you know is causing that.
+
+**Bridging.** When a golden field's tables share nothing with any earlier
+field, ``build_query`` scans every query file for any direct
+``real_table JOIN real_table ON a.x = b.y`` (see ``joins.join_extractor``)
+and tries to path-find a connection — even through further tables that
+aren't part of any golden field at all. A successful bridge becomes its
+own small lookup CTE (``entity_side_key``/``field_side_key``) so it
+doesn't disturb either side's own query. Flagged with a warning either
+way, since it isn't something any golden field itself vouches for. Set
+``patch_missing_joins=False`` to disable this and require every field to
+share a table with the entity outright.
 
 A multi-source ``SELECT *`` candidate that turns out to be flat wrong (the
 column doesn't actually exist in that table — see ``lineage_resolver.py``'s
 ambiguous-star handling) can be dropped with ``exclude_sources``: pass a
 path to a JSON exclude-list file, or a collection of exclusion strings
 directly (see ``joins.exclusions``). Excluded candidates are removed
-*before* join-key inference runs, so a bad candidate can't poison a join
-condition either, not just the SELECT's COALESCE.
+*before* any join-key inference runs.
 """
 
 from __future__ import annotations
 
+import re
 from collections import deque
 from dataclasses import dataclass, field
+from itertools import count
 
 from joins.exclusions import is_excluded, load_exclusions
 from joins.join_extractor import extract_bridge_edges
-from joins.models import GoldenFieldSpec, ResolvedSource
+from joins.models import ResolvedSource
 from joins.resolver import load_golden_structure, resolve_source_field
 
 
@@ -62,28 +83,37 @@ def _table_alias(table: str) -> str:
     return table.replace(".", "_")
 
 
-def _format_join(table: str, alias: str, conditions: list[str]) -> str:
-    """Render one LEFT JOIN with each ON/AND condition on its own indented
+def _connector_alias(table: str) -> str:
+    return f"{_table_alias(table)}__key"
+
+
+def _safe_ident(name: str) -> str:
+    """A CTE-name-safe version of an arbitrary golden field name."""
+    safe = re.sub(r"[^0-9A-Za-z_]", "_", name)
+    return safe or "field"
+
+
+def _format_join(table: str, alias: str, conditions: list[str], keyword: str = "LEFT JOIN") -> str:
+    """Render one JOIN with each ON/AND condition on its own indented
     line, e.g.::
 
         LEFT JOIN table2 AS alias2
             ON table1.column = table2.column
             AND table1.column = table2.column
     """
-    lines = [f"LEFT JOIN {table} AS {alias}"]
+    lines = [f"{keyword} {table} AS {alias}"]
     for i, cond in enumerate(conditions):
-        keyword = "ON" if i == 0 else "AND"
-        lines.append(f"    {keyword} {cond}")
+        kw = "ON" if i == 0 else "AND"
+        lines.append(f"    {kw} {cond}")
     return "\n".join(lines)
 
 
 def _bfs_path(start_set: set[str], target: str, edges: dict[frozenset, list]):
     """Shortest path (list of ``(parent, node, edge_key)``) from any table
-    in ``start_set`` to ``target`` over ``edges`` (a table-pair graph, see
-    ``full_edges`` in ``build_query``). Returns ``None`` if unreachable.
-    Only ``node``s not already in ``start_set`` appear in the returned
-    path — i.e. it's exactly the new tables/joins needed to reach
-    ``target``."""
+    in ``start_set`` to ``target`` over ``edges`` (a table-pair graph).
+    Returns ``None`` if unreachable. Only ``node``s not already in
+    ``start_set`` appear in the returned path — i.e. it's exactly the new
+    tables/joins needed to reach ``target``."""
     if target in start_set:
         return []
     prev: dict[str, tuple[str, frozenset]] = {}
@@ -123,6 +153,15 @@ def _sql_literal(value) -> str:
         return str(value)
     escaped = str(value).replace("'", "''")
     return f"'{escaped}'"
+
+
+def _select_item(args: list[str], alias: str) -> str:
+    if len(args) == 1:
+        return f"{args[0]} AS {alias}"
+    # Each COALESCE arg on its own line, indented one level deeper than the
+    # item itself; the closing paren dedents back to the item's own indent.
+    inner = ",\n".join(f"        {a}" for a in args)
+    return f"COALESCE(\n{inner}\n    ) AS {alias}"
 
 
 def build_query(
@@ -176,22 +215,19 @@ def build_query(
                 warnings.append(f"golden field '{gname}': source field '{sf}': {d}")
             resolved[gname][sf] = hits
 
-    # -- infer join edges: for each golden field, group its resolved hits by
-    # source field (one group per source field — a group has 1 entry when
-    # unambiguous, 2+ when ambiguous), then connect consecutive groups'
-    # DISTINCT TABLES pairwise. For the common unambiguous case each group
-    # has exactly one table, so this is exactly one edge per adjacent pair
-    # of source fields (same as before). When a group is ambiguous (spans
-    # multiple tables), every one of its tables gets its own independent
-    # edge against every table in the next group — each is a separate join
-    # condition, so an unmatched candidate just contributes NULLs rather
-    # than blocking the real match. -----------------------------------------
-    # edge key: frozenset({table_a, table_b}) -> list[(ResolvedSource_a, ResolvedSource_b)]
-    join_edges: dict[frozenset, list[tuple[ResolvedSource, ResolvedSource]]] = {}
-    all_tables: dict[str, ResolvedSource] = {}  # table_ref -> a representative ResolvedSource (for alias/table name)
+    # -- per golden field: its own table set + its own self-contained join
+    # edges (shared source tables within *that field's* coalesce list only
+    # — never mixed with another field's). Every field's own graph is
+    # guaranteed fully connected (each source field only ever creates
+    # edges to its immediate neighbor in the source_fields list, forming a
+    # path graph), so there's no "unreachable table" case *within* one
+    # field. --------------------------------------------------------------
+    field_tables: dict[str, dict[str, ResolvedSource]] = {}  # gname -> table -> representative hit
+    field_join_edges: dict[str, dict[frozenset, list[tuple[ResolvedSource, ResolvedSource]]]] = {}
 
     for gname, spec in golden_structure.items():
         groups: list[list[ResolvedSource]] = []
+        local_tables: dict[str, ResolvedSource] = {}
         for sf in spec.source_fields:
             hits = resolved[gname][sf]
             if len(hits) > 1:
@@ -203,12 +239,10 @@ def build_query(
                     f"SELECT's COALESCE)"
                 )
             for h in hits:
-                all_tables.setdefault(h.table, h)
+                local_tables.setdefault(h.table, h)
             if hits:
                 groups.append(hits)
 
-        # one representative candidate per distinct table, per group (so an
-        # ambiguous group contributes one candidate per table it touches)
         table_groups: list[list[ResolvedSource]] = []
         for g in groups:
             per_table: dict[str, ResolvedSource] = {}
@@ -216,142 +250,37 @@ def build_query(
                 per_table.setdefault(r.table, r)
             table_groups.append(list(per_table.values()))
 
+        local_edges: dict[frozenset, list[tuple[ResolvedSource, ResolvedSource]]] = {}
         for group_a, group_b in zip(table_groups, table_groups[1:]):
             for a in group_a:
                 for b in group_b:
                     if a.table == b.table:
                         continue
                     key = frozenset((a.table, b.table))
-                    join_edges.setdefault(key, []).append((a, b))
+                    local_edges.setdefault(key, []).append((a, b))
 
-    # -- build a join order: spanning tree over all_tables using join_edges,
-    # anchored on the first table encountered (dict preserves insertion
-    # order). Any table with no path back to the anchor via a known edge
-    # can't be placed in a single join graph — flagged, not guessed. -------
-    table_refs = list(all_tables.keys())
-    from_clauses: list[str] = []
-    joined: set[str] = set()
+        field_tables[gname] = local_tables
+        field_join_edges[gname] = local_edges
 
-    if table_refs:
-        anchor = table_refs[0]
-        anchor_source = all_tables[anchor]
-        from_clauses.append(f"FROM {anchor} AS {anchor_source.alias}")
-        joined.add(anchor)
+    # -- build one CTE per golden field, folding each into a growing
+    # "entity" CTE chain via whichever physical table(s) it shares with
+    # what's been built so far (or a bridged connection). ------------------
+    ctes: list[str] = []
+    connector_col: dict[str, str] = {}  # table -> the raw column that identifies it from now on
+    entity_name: str | None = None
+    entity_tables: set[str] = set()
+    entity_gnames: list[str] = []
+    pending_literal_selects: dict[str, str] = {}
+    bridge_edges = None  # lazily computed (extract_bridge_edges), at most once
+    full_edges: dict[frozenset, list[tuple[str, str, str, str, str]]] | None = None  # lazily built, at most once
+    cte_seq = count(1)
 
-        # simple BFS over join_edges from the anchor
-        frontier = [anchor]
-        while frontier:
-            next_frontier = []
-            for t in frontier:
-                for key, conditions in join_edges.items():
-                    if t not in key:
-                        continue
-                    other = next(x for x in key if x != t)
-                    if other in joined:
-                        continue
-                    other_source = all_tables[other]
-                    on_parts = [f"{a.sql_ref} = {b.sql_ref}" for a, b in conditions]
-                    from_clauses.append(_format_join(other, other_source.alias, on_parts))
-                    joined.add(other)
-                    next_frontier.append(other)
-            frontier = next_frontier
-
-        unreachable = [t for t in table_refs if t not in joined]
-
-        if unreachable and patch_missing_joins:
-            # -- patch pass: no golden field alone connects these tables,
-            # but maybe some query file's actual SQL already joins them (or
-            # joins them via further intermediate tables) directly. Build a
-            # combined graph of golden-derived edges + every direct
-            # real-table JOIN condition found anywhere in queries_dir, and
-            # try to path-find from the tables already joined out to each
-            # orphan, adding whatever new tables/joins that path needs. ----
-            bridge_edges = extract_bridge_edges(queries_dir)
-            full_edges: dict[frozenset, list[tuple[str, str, str, str, str]]] = {}
-            for key, conditions in join_edges.items():
-                for a, b in conditions:
-                    full_edges.setdefault(key, []).append((a.table, a.sql_ref, b.table, b.sql_ref, "golden"))
-            for key, bridge_list in bridge_edges.items():
-                for be in bridge_list:
-                    full_edges.setdefault(key, []).append(
-                        (
-                            be.table_a,
-                            f"{_table_alias(be.table_a)}.{be.col_a}",
-                            be.table_b,
-                            f"{_table_alias(be.table_b)}.{be.col_b}",
-                            f"patched:{be.query_file}",
-                        )
-                    )
-
-            still_unreachable: list[str] = []
-            for t in unreachable:
-                path = _bfs_path(joined, t, full_edges)
-                if not path:
-                    still_unreachable.append(t)
-                    continue
-
-                patched_files: set[str] = set()
-                for parent, node, key in path:
-                    conds = full_edges[key]
-                    golden_conds = [c for c in conds if c[4] == "golden"]
-                    # golden-field-derived conditions are trusted over
-                    # patched ones when both exist for the same table pair.
-                    chosen = golden_conds if golden_conds else conds
-
-                    pairs: list[tuple[str, str]] = []
-                    for ta, sa, tb, sb, label in chosen:
-                        if label != "golden":
-                            patched_files.add(label.split(":", 1)[1])
-                        pair = (sa, sb) if ta == parent else (sb, sa)
-                        if pair not in pairs:
-                            pairs.append(pair)
-
-                    if len(pairs) > 1 and not golden_conds:
-                        warnings.append(
-                            f"multiple different join conditions were found "
-                            f"between '{parent}' and '{node}' across query "
-                            f"files ({', '.join(sorted(patched_files))}) — "
-                            f"using all of them ANDed together; verify this "
-                            f"is correct"
-                        )
-
-                    parts = [f"{left} = {right}" for left, right in pairs]
-                    from_clauses.append(_format_join(node, _table_alias(node), parts))
-                    joined.add(node)
-                    if node not in all_tables:
-                        warnings.append(
-                            f"table '{node}' was added to the query only to "
-                            f"bridge a join path — it's not itself used by "
-                            f"any golden field; verify it's correct and "
-                            f"remove it if unnecessary"
-                        )
-
-                if patched_files:
-                    warnings.append(
-                        f"table '{t}' had no join key derivable from any "
-                        f"golden field alone — patched in using a join "
-                        f"condition found in {', '.join(sorted(patched_files))}; "
-                        f"verify this is correct before relying on it"
-                    )
-
-            unreachable = still_unreachable
-
-        for t in unreachable:
-            warnings.append(
-                f"table '{t}' shares no golden field with any other joined "
-                f"table, and no direct join to it was found in any query "
-                f"file either — it's left out of the generated FROM/JOIN "
-                f"entirely; add it manually with the correct join key"
-            )
-
-    # -- build the SELECT list --------------------------------------------
-    select_lines: list[str] = []
     for gname, spec in golden_structure.items():
+        local_tables = field_tables[gname]
+
         seen_refs: list[str] = []
         for sf in spec.source_fields:
             for h in resolved[gname][sf]:
-                if h.table not in joined:
-                    continue  # excluded table — can't reference it, already warned above
                 if h.sql_ref not in seen_refs:
                     seen_refs.append(h.sql_ref)
 
@@ -362,18 +291,191 @@ def build_query(
         if not args:
             warnings.append(f"golden field '{gname}': nothing to select (no resolved columns, no literal) — skipped")
             continue
-        elif len(args) == 1:
-            select_lines.append(f"{args[0]} AS {gname}")
-        else:
-            # Each COALESCE arg on its own line, indented one level deeper
-            # than the item itself; the closing paren dedents back to the
-            # item's own indent (matching the outer "    " every select
-            # item gets from the join below).
-            inner = ",\n".join(f"        {a}" for a in args)
-            select_lines.append(f"COALESCE(\n{inner}\n    ) AS {gname}")
 
-    select_clause = "SELECT\n    " + ",\n    ".join(select_lines)
-    from_clause = "\n".join(from_clauses) if from_clauses else "-- no source tables resolved"
-    sql = f"{select_clause}\n{from_clause}"
+        this_tables = set(local_tables.keys())
+
+        if not this_tables:
+            # Literal-only (either no source fields at all, or none of them
+            # resolved) — not tied to any row, so it needs no join; folded
+            # into the final SELECT once the entity is assembled below.
+            pending_literal_selects[gname] = _select_item(args, gname)
+            continue
+
+        # -- this field's own self-contained FROM/JOIN --------------------
+        local_edges = field_join_edges[gname]
+        local_table_refs = list(local_tables.keys())
+        anchor = local_table_refs[0]
+        from_lines = [f"FROM {anchor} AS {_table_alias(anchor)}"]
+        local_joined = {anchor}
+        frontier = [anchor]
+        while frontier:
+            next_frontier = []
+            for t in frontier:
+                for key, conditions in local_edges.items():
+                    if t not in key:
+                        continue
+                    other = next(x for x in key if x != t)
+                    if other in local_joined:
+                        continue
+                    on_parts = [f"{a.sql_ref} = {b.sql_ref}" for a, b in conditions]
+                    from_lines.append(_format_join(other, _table_alias(other), on_parts))
+                    local_joined.add(other)
+                    next_frontier.append(other)
+            frontier = next_frontier
+
+        select_items = [_select_item(args, gname)]
+        for t in sorted(this_tables):
+            if t not in connector_col:
+                connector_col[t] = local_tables[t].column
+            select_items.append(f"{_table_alias(t)}.{connector_col[t]} AS {_connector_alias(t)}")
+
+        cte_sql = "SELECT\n    " + ",\n    ".join(select_items) + "\n" + "\n".join(from_lines)
+        cte_name = f"cte_{next(cte_seq)}_{_safe_ident(gname)}"
+        # Appended right away (even before we know whether this field can be
+        # connected to the entity) so CTE numbering matches text order, and
+        # so a field that ends up disconnected still leaves its own
+        # self-contained join sitting in the output for manual wiring.
+        ctes.append(f"{cte_name} AS (\n{cte_sql}\n)")
+
+        if entity_name is None:
+            entity_name = cte_name
+            entity_tables = set(this_tables)
+            entity_gnames = [gname]
+            continue
+
+        shared = this_tables & entity_tables
+        bridge_cte_name = None
+        bridge_start_table = None
+        bridge_target_table = None
+
+        if not shared and patch_missing_joins:
+            if bridge_edges is None:
+                bridge_edges = extract_bridge_edges(queries_dir)
+            if full_edges is None:
+                full_edges = {}
+                for edges2 in field_join_edges.values():
+                    for key, conditions in edges2.items():
+                        for a, b in conditions:
+                            full_edges.setdefault(key, []).append((a.table, a.sql_ref, b.table, b.sql_ref, "golden"))
+                for key, bridge_list in bridge_edges.items():
+                    for be in bridge_list:
+                        full_edges.setdefault(key, []).append(
+                            (
+                                be.table_a,
+                                f"{_table_alias(be.table_a)}.{be.col_a}",
+                                be.table_b,
+                                f"{_table_alias(be.table_b)}.{be.col_b}",
+                                f"patched:{be.query_file}",
+                            )
+                        )
+
+            path = None
+            for candidate in sorted(this_tables):
+                p = _bfs_path(entity_tables, candidate, full_edges)
+                if p:
+                    path = p
+                    bridge_target_table = candidate
+                    break
+
+            if path is not None:
+                bridge_start_table = path[0][0]
+                bridge_from = [f"FROM {bridge_start_table} AS {_table_alias(bridge_start_table)}"]
+                patched_files: set[str] = set()
+                for parent, node, key in path:
+                    conds = full_edges[key]
+                    golden_conds = [c for c in conds if c[4] == "golden"]
+                    # golden-field-derived conditions are trusted over
+                    # patched ones when both exist for the same table pair.
+                    chosen = golden_conds if golden_conds else conds
+                    pairs: list[tuple[str, str]] = []
+                    for ta, sa, tb, sb, label in chosen:
+                        if label != "golden":
+                            patched_files.add(label.split(":", 1)[1])
+                        pair = (sa, sb) if ta == parent else (sb, sa)
+                        if pair not in pairs:
+                            pairs.append(pair)
+                    if len(pairs) > 1 and not golden_conds:
+                        warnings.append(
+                            f"multiple different join conditions were found "
+                            f"between '{parent}' and '{node}' across query "
+                            f"files ({', '.join(sorted(patched_files))}) — "
+                            f"using all of them ANDed together; verify this "
+                            f"is correct"
+                        )
+                    parts = [f"{left} = {right}" for left, right in pairs]
+                    bridge_from.append(_format_join(node, _table_alias(node), parts, keyword="JOIN"))
+
+                if bridge_target_table not in connector_col:
+                    connector_col[bridge_target_table] = local_tables[bridge_target_table].column
+
+                bridge_select = [
+                    f"{_table_alias(bridge_start_table)}.{connector_col[bridge_start_table]} AS entity_side_key",
+                    f"{_table_alias(bridge_target_table)}.{connector_col[bridge_target_table]} AS field_side_key",
+                ]
+                bridge_sql = "SELECT\n    " + ",\n    ".join(bridge_select) + "\n" + "\n".join(bridge_from)
+                bridge_cte_name = f"cte_{next(cte_seq)}_bridge_{_safe_ident(gname)}"
+                ctes.append(f"{bridge_cte_name} AS (\n{bridge_sql}\n)")
+
+                warnings.append(
+                    f"golden field '{gname}' shares no table with the entity "
+                    f"built so far — bridged via a join condition found in "
+                    f"{', '.join(sorted(patched_files)) or 'the resolved golden fields'} "
+                    f"connecting '{bridge_start_table}' to '{bridge_target_table}'; "
+                    f"verify this is correct before relying on it"
+                )
+
+        if not shared and bridge_cte_name is None:
+            warnings.append(
+                f"golden field '{gname}' shares no table with the entity "
+                f"built so far, and no join path could be found to connect "
+                f"it either — its column is left out of the final result; "
+                f"add the join manually"
+            )
+            continue
+
+        new_tables = this_tables - entity_tables
+        merged_select = [f"{entity_name}.{g} AS {g}" for g in entity_gnames]
+        merged_select += [f"{entity_name}.{_connector_alias(t)} AS {_connector_alias(t)}" for t in sorted(entity_tables)]
+        merged_select.append(f"{cte_name}.{gname} AS {gname}")
+        merged_select += [f"{cte_name}.{_connector_alias(t)} AS {_connector_alias(t)}" for t in sorted(new_tables)]
+
+        if shared:
+            on_parts = [f"{entity_name}.{_connector_alias(t)} = {cte_name}.{_connector_alias(t)}" for t in sorted(shared)]
+            join_lines = [f"LEFT JOIN {cte_name}"]
+            for i, cond in enumerate(on_parts):
+                join_lines.append(f"    {'ON' if i == 0 else 'OR'} {cond}")
+            merged_from = [f"FROM {entity_name}", "\n".join(join_lines)]
+        else:
+            merged_from = [
+                f"FROM {entity_name}",
+                f"LEFT JOIN {bridge_cte_name}\n    ON {entity_name}.{_connector_alias(bridge_start_table)} = {bridge_cte_name}.entity_side_key",
+                f"LEFT JOIN {cte_name}\n    ON {bridge_cte_name}.field_side_key = {cte_name}.{_connector_alias(bridge_target_table)}",
+            ]
+
+        merged_sql = "SELECT\n    " + ",\n    ".join(merged_select) + "\n" + "\n".join(merged_from)
+        new_entity_name = f"entity_{next(cte_seq)}"
+        ctes.append(f"{new_entity_name} AS (\n{merged_sql}\n)")
+
+        entity_name = new_entity_name
+        entity_tables = entity_tables | this_tables
+        entity_gnames = entity_gnames + [gname]
+
+    # -- final SELECT, in golden_record_structure.json's own field order --
+    entity_gname_set = set(entity_gnames)
+    select_lines: list[str] = []
+    for gname in golden_structure:
+        if gname in pending_literal_selects:
+            select_lines.append(pending_literal_selects[gname])
+        elif gname in entity_gname_set:
+            select_lines.append(f"{entity_name}.{gname} AS {gname}")
+        # else: already warned about (nothing resolved, or couldn't connect)
+
+    select_clause = "SELECT\n    " + (",\n    ".join(select_lines) if select_lines else "-- nothing resolved")
+
+    if entity_name is None:
+        sql = f"{select_clause}\n-- no source tables resolved"
+    else:
+        with_clause = "WITH " + ",\n".join(ctes)
+        sql = f"{with_clause}\n{select_clause}\nFROM {entity_name}"
 
     return BuildResult(sql=sql, warnings=warnings)
