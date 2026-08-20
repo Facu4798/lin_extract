@@ -1,0 +1,4 @@
+field, description
+id,Unique identifier for the order
+customer_id,Unique identifier for the customer who placed the order
+amount,Total amount of the order

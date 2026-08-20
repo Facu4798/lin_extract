@@ -1,0 +1,13 @@
+{
+  "positions": {
+    "customers.csv": [
+      60,
+      50
+    ],
+    "orders.csv": [
+      448.0,
+      46.0
+    ]
+  },
+  "connections": []
+}
