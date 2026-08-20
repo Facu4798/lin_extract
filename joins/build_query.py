@@ -8,7 +8,8 @@ Python extension's "Run Python File" button in VSCode).
 
 import os
 import sys
-
+import subprocess
+subprocess.run(["cls"],shell=True)
 # This file lives inside the `joins` package but is meant to be run
 # directly, which sets sys.path[0] to this file's own directory rather than
 # its parent. Add the parent directory so `import joins.xxx`/`import
@@ -20,10 +21,15 @@ from joins.query_builder import build_query
 # ---------------------------------------------------------------------------
 GOLDEN_STRUCTURE_FILE = "joins/golden_record_structure.json"
 QUERIES_DIR = "queries"
+# Path to a JSON exclude-list (see joins/exclusions.py) of known-bad
+# SELECT * candidate columns to drop from both the COALESCE and join-key
+# inference — e.g. ["analytics_x_cdz.t2.name"] or, to scope it to one
+# query file, ["analytics_x_cdz.t2.name&life.txt"]. Leave as None to skip.
+EXCLUDE_SOURCES_FILE = None
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    result = build_query(GOLDEN_STRUCTURE_FILE, QUERIES_DIR)
+    result = build_query(GOLDEN_STRUCTURE_FILE, QUERIES_DIR, exclude_sources=EXCLUDE_SOURCES_FILE)
 
     print(result.sql)
 

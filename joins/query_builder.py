@@ -31,6 +31,14 @@ than guess, same policy as the ``lineage`` package):
   INNER instead, treat this as a first draft to hand-edit, not a final
   query — the generated SQL is meant to save the mechanical part, not
   replace review.
+
+A multi-source ``SELECT *`` candidate that turns out to be flat wrong (the
+column doesn't actually exist in that table — see ``lineage_resolver.py``'s
+ambiguous-star handling) can be dropped with ``exclude_sources``: pass a
+path to a JSON exclude-list file, or a collection of exclusion strings
+directly (see ``joins.exclusions``). Excluded candidates are removed
+*before* join-key inference runs, so a bad candidate can't poison a join
+condition either, not just the SELECT's COALESCE.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 
+from joins.exclusions import is_excluded, load_exclusions
 from joins.join_extractor import extract_bridge_edges
 from joins.models import GoldenFieldSpec, ResolvedSource
 from joins.resolver import load_golden_structure, resolve_source_field
@@ -116,9 +125,20 @@ def _sql_literal(value) -> str:
     return f"'{escaped}'"
 
 
-def build_query(golden_structure_path: str, queries_dir: str, patch_missing_joins: bool = True) -> BuildResult:
+def build_query(
+    golden_structure_path: str,
+    queries_dir: str,
+    patch_missing_joins: bool = True,
+    exclude_sources: "str | set[str] | list[str] | None" = None,
+) -> BuildResult:
     golden_structure = load_golden_structure(golden_structure_path)
     warnings: list[str] = []
+
+    exclusions: set[str] = set()
+    if isinstance(exclude_sources, str):
+        exclusions = load_exclusions(exclude_sources)
+    elif exclude_sources:
+        exclusions = set(exclude_sources)
 
     # golden_field_name -> source_field_name -> [ResolvedSource, ...]
     resolved: dict[str, dict[str, list[ResolvedSource]]] = {}
@@ -126,6 +146,20 @@ def build_query(golden_structure_path: str, queries_dir: str, patch_missing_join
         resolved[gname] = {}
         for sf in spec.source_fields:
             hits, diagnostics = resolve_source_field(sf, queries_dir)
+
+            if exclusions:
+                kept, excluded = [], []
+                for h in hits:
+                    (excluded if is_excluded(h, exclusions) else kept).append(h)
+                for h in excluded:
+                    warnings.append(
+                        f"golden field '{gname}': source field '{sf}': "
+                        f"excluded candidate {h.tagged} (user-provided "
+                        f"exclude list) — removed before join-key inference "
+                        f"and the SELECT's COALESCE"
+                    )
+                hits = kept
+
             if not hits:
                 warnings.append(
                     f"golden field '{gname}': source field '{sf}' did not "
