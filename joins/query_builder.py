@@ -53,6 +53,21 @@ def _table_alias(table: str) -> str:
     return table.replace(".", "_")
 
 
+def _format_join(table: str, alias: str, conditions: list[str]) -> str:
+    """Render one LEFT JOIN with each ON/AND condition on its own indented
+    line, e.g.::
+
+        LEFT JOIN table2 AS alias2
+            ON table1.column = table2.column
+            AND table1.column = table2.column
+    """
+    lines = [f"LEFT JOIN {table} AS {alias}"]
+    for i, cond in enumerate(conditions):
+        keyword = "ON" if i == 0 else "AND"
+        lines.append(f"    {keyword} {cond}")
+    return "\n".join(lines)
+
+
 def _bfs_path(start_set: set[str], target: str, edges: dict[frozenset, list]):
     """Shortest path (list of ``(parent, node, edge_key)``) from any table
     in ``start_set`` to ``target`` over ``edges`` (a table-pair graph, see
@@ -202,10 +217,7 @@ def build_query(golden_structure_path: str, queries_dir: str, patch_missing_join
                         continue
                     other_source = all_tables[other]
                     on_parts = [f"{a.sql_ref} = {b.sql_ref}" for a, b in conditions]
-                    from_clauses.append(
-                        f"LEFT JOIN {other} AS {other_source.alias} ON "
-                        + " AND ".join(on_parts)
-                    )
+                    from_clauses.append(_format_join(other, other_source.alias, on_parts))
                     joined.add(other)
                     next_frontier.append(other)
             frontier = next_frontier
@@ -270,7 +282,7 @@ def build_query(golden_structure_path: str, queries_dir: str, patch_missing_join
                         )
 
                     parts = [f"{left} = {right}" for left, right in pairs]
-                    from_clauses.append(f"LEFT JOIN {node} AS {_table_alias(node)} ON " + " AND ".join(parts))
+                    from_clauses.append(_format_join(node, _table_alias(node), parts))
                     joined.add(node)
                     if node not in all_tables:
                         warnings.append(
@@ -319,7 +331,12 @@ def build_query(golden_structure_path: str, queries_dir: str, patch_missing_join
         elif len(args) == 1:
             select_lines.append(f"{args[0]} AS {gname}")
         else:
-            select_lines.append(f"COALESCE({', '.join(args)}) AS {gname}")
+            # Each COALESCE arg on its own line, indented one level deeper
+            # than the item itself; the closing paren dedents back to the
+            # item's own indent (matching the outer "    " every select
+            # item gets from the join below).
+            inner = ",\n".join(f"        {a}" for a in args)
+            select_lines.append(f"COALESCE(\n{inner}\n    ) AS {gname}")
 
     select_clause = "SELECT\n    " + ",\n    ".join(select_lines)
     from_clause = "\n".join(from_clauses) if from_clauses else "-- no source tables resolved"
