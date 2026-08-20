@@ -33,6 +33,12 @@ DEDUP_PARTITION_BY = None  # e.g. ["nationalId"]
 # Golden field names to break dedup ties by; each entry may end in " ASC"
 # or " DESC" (default ASC if omitted) — e.g. ["updatedAt DESC"].
 DEDUP_ORDER_BY = None
+# If True, emit a sequence of "CREATE OR REPLACE TEMP VIEW ...;" statements
+# (one per stage) plus a final "SELECT ...;", instead of one WITH-clause
+# query — split on ";" and run/cache each statement to let Spark
+# materialize each stage instead of re-deriving the whole upstream chain
+# every time. If False, emit the usual single WITH-clause query.
+AS_TEMP_VIEWS = False
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -42,6 +48,7 @@ if __name__ == "__main__":
         exclude_sources=EXCLUDE_SOURCES_FILE,
         dedup_partition_by=DEDUP_PARTITION_BY,
         dedup_order_by=DEDUP_ORDER_BY,
+        as_temp_views=AS_TEMP_VIEWS,
     )
 
     print(result.sql)

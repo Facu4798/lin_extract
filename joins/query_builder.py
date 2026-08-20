@@ -86,6 +86,19 @@ deterministic order has no principled way to pick which row survives);
 every field named in either must be one of the golden fields that
 actually made it into the result, or ``build_query`` raises ``ValueError``
 rather than silently ignoring a typo.
+
+**Output format.** By default ``.sql`` is one query using a ``WITH``
+clause (each CTE referenced exactly once, so Spark just inlines it —
+no different from nesting the same thing as subqueries). Pass
+``as_temp_views=True`` to instead get a sequence of standalone
+``CREATE OR REPLACE TEMP VIEW <name> AS (...);`` statements, one per
+stage, followed by the final ``SELECT ...;`` — semicolon-terminated so a
+caller can ``sql.split(";")`` and run/cache each statement individually
+(e.g. ``spark.sql(stmt); spark.catalog.cacheTable(name)`` after each
+``CREATE VIEW``). That's what actually lets Spark materialize each stage
+instead of re-deriving the whole upstream chain every time, and is
+generally the more useful mode once the query has enough stages to be
+worth caching — plain CTE syntax alone doesn't get you that for free.
 """
 
 from __future__ import annotations
@@ -183,6 +196,15 @@ def _sql_literal(value) -> str:
     return f"'{escaped}'"
 
 
+def _emit_cte(name: str, sql: str, as_temp_views: bool) -> str:
+    """One CTE's text, either as a ``WITH`` clause fragment (default) or as
+    a standalone ``CREATE OR REPLACE TEMP VIEW ...;`` statement — see
+    ``as_temp_views`` on ``build_query``."""
+    if as_temp_views:
+        return f"CREATE OR REPLACE TEMP VIEW {name} AS (\n{sql}\n);"
+    return f"{name} AS (\n{sql}\n)"
+
+
 def _select_item(args: list[str], alias: str) -> str:
     if len(args) == 1:
         return f"{args[0]} AS {alias}"
@@ -199,6 +221,7 @@ def build_query(
     exclude_sources: "str | set[str] | list[str] | None" = None,
     dedup_partition_by: "list[str] | None" = None,
     dedup_order_by: "list[str] | None" = None,
+    as_temp_views: bool = False,
 ) -> BuildResult:
     golden_structure = load_golden_structure(golden_structure_path)
     warnings: list[str] = []
@@ -369,7 +392,7 @@ def build_query(
         # connected to the entity) so CTE numbering matches text order, and
         # so a field that ends up disconnected still leaves its own
         # self-contained join sitting in the output for manual wiring.
-        ctes.append(f"{cte_name} AS (\n{cte_sql}\n)")
+        ctes.append(_emit_cte(cte_name, cte_sql, as_temp_views))
 
         if entity_name is None:
             entity_name = cte_name
@@ -448,7 +471,7 @@ def build_query(
                 ]
                 bridge_sql = "SELECT\n    " + ",\n    ".join(bridge_select) + "\n" + "\n".join(bridge_from)
                 bridge_cte_name = f"cte_{next(cte_seq)}_bridge_{_safe_ident(gname)}"
-                ctes.append(f"{bridge_cte_name} AS (\n{bridge_sql}\n)")
+                ctes.append(_emit_cte(bridge_cte_name, bridge_sql, as_temp_views))
 
                 warnings.append(
                     f"golden field '{gname}' shares no table with the entity "
@@ -488,7 +511,7 @@ def build_query(
 
         merged_sql = "SELECT\n    " + ",\n    ".join(merged_select) + "\n" + "\n".join(merged_from)
         new_entity_name = f"entity_{next(cte_seq)}"
-        ctes.append(f"{new_entity_name} AS (\n{merged_sql}\n)")
+        ctes.append(_emit_cte(new_entity_name, merged_sql, as_temp_views))
 
         entity_name = new_entity_name
         entity_tables = entity_tables | this_tables
@@ -505,6 +528,9 @@ def build_query(
         elif gname in entity_gname_set:
             field_exprs[gname] = f"{entity_name}.{gname}"
         # else: already warned about (nothing resolved, or couldn't connect)
+
+    final_from = entity_name
+    where_clause = ""
 
     if dedup_partition_by or dedup_order_by:
         if entity_name is None:
@@ -557,21 +583,28 @@ def build_query(
         )
         ranked_sql = "SELECT\n    " + ",\n    ".join(ranked_select) + f"\nFROM {entity_name}"
         ranked_name = f"cte_{next(cte_seq)}_ranked"
-        ctes.append(f"{ranked_name} AS (\n{ranked_sql}\n)")
+        ctes.append(_emit_cte(ranked_name, ranked_sql, as_temp_views))
 
-        select_clause = "SELECT\n    " + ",\n    ".join(field_exprs.keys())
-        with_clause = "WITH " + ",\n".join(ctes)
-        sql = f"{with_clause}\n{select_clause}\nFROM {ranked_name}\nWHERE _dedup_row_number = 1"
-        return BuildResult(sql=sql, warnings=warnings)
+        final_from = ranked_name
+        where_clause = "\nWHERE _dedup_row_number = 1"
+        select_lines = list(field_exprs.keys())  # already aliased inside the ranked CTE
+    else:
+        select_lines = [f"{expr} AS {gname}" for gname, expr in field_exprs.items()]
 
-    # -- no dedup requested: plain final SELECT off the entity -------------
-    select_lines = [f"{expr} AS {gname}" for gname, expr in field_exprs.items()]
     select_clause = "SELECT\n    " + (",\n    ".join(select_lines) if select_lines else "-- nothing resolved")
 
-    if entity_name is None:
+    if final_from is None:
         sql = f"{select_clause}\n-- no source tables resolved"
+        if as_temp_views and select_lines:
+            sql = f"{select_clause};"
+        return BuildResult(sql=sql, warnings=warnings)
+
+    final_stmt = f"{select_clause}\nFROM {final_from}{where_clause}"
+
+    if as_temp_views:
+        sql = "\n\n".join(ctes + [f"{final_stmt};"])
     else:
         with_clause = "WITH " + ",\n".join(ctes)
-        sql = f"{with_clause}\n{select_clause}\nFROM {entity_name}"
+        sql = f"{with_clause}\n{final_stmt}"
 
     return BuildResult(sql=sql, warnings=warnings)
