@@ -14,8 +14,17 @@ than guess, same policy as the ``lineage`` package):
   all — equivalent to "whichever candidate actually matches wins", since
   each candidate's condition is separate and unmatched ones just stay NULL.
   A table that never shares a golden field with any other table at all
-  has no inferable join key, and is reported as a warning rather than
-  silently cross-joined or dropped.
+  has no inferable join key from golden fields alone. Before giving up on
+  it, ``build_query`` tries one more thing: it scans every query file for
+  *any* direct ``real_table JOIN real_table ON a.x = b.y`` condition
+  (regardless of whether that field is part of the golden record at all)
+  and, if one connects the orphaned table back to the rest of the query
+  (possibly by pulling in further tables purely as bridges, not selected
+  from), patches it in as a LEFT JOIN — flagged with a warning either way,
+  since it wasn't derived from a golden field and deserves a look. Only if
+  no such join can be found anywhere is the table left out entirely (still
+  warned about). Set ``patch_missing_joins=False`` to disable this and get
+  the old strict behavior.
 - **Join type.** Every join defaults to LEFT (anchored on the first table
   encountered), since that's the only choice that can never drop a row a
   coalesce might still want data from. If you need a specific join to be
@@ -26,8 +35,10 @@ than guess, same policy as the ``lineage`` package):
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 
+from joins.join_extractor import extract_bridge_edges
 from joins.models import GoldenFieldSpec, ResolvedSource
 from joins.resolver import load_golden_structure, resolve_source_field
 
@@ -36,6 +47,47 @@ from joins.resolver import load_golden_structure, resolve_source_field
 class BuildResult:
     sql: str
     warnings: list[str] = field(default_factory=list)
+
+
+def _table_alias(table: str) -> str:
+    return table.replace(".", "_")
+
+
+def _bfs_path(start_set: set[str], target: str, edges: dict[frozenset, list]):
+    """Shortest path (list of ``(parent, node, edge_key)``) from any table
+    in ``start_set`` to ``target`` over ``edges`` (a table-pair graph, see
+    ``full_edges`` in ``build_query``). Returns ``None`` if unreachable.
+    Only ``node``s not already in ``start_set`` appear in the returned
+    path — i.e. it's exactly the new tables/joins needed to reach
+    ``target``."""
+    if target in start_set:
+        return []
+    prev: dict[str, tuple[str, frozenset]] = {}
+    visited = set(start_set)
+    dq = deque(start_set)
+    while dq:
+        cur = dq.popleft()
+        if cur == target:
+            break
+        for key in edges:
+            if cur not in key:
+                continue
+            other = next(x for x in key if x != cur)
+            if other in visited:
+                continue
+            visited.add(other)
+            prev[other] = (cur, key)
+            dq.append(other)
+    if target not in visited:
+        return None
+    path = []
+    node = target
+    while node not in start_set:
+        parent, key = prev[node]
+        path.append((parent, node, key))
+        node = parent
+    path.reverse()
+    return path
 
 
 def _sql_literal(value) -> str:
@@ -49,7 +101,7 @@ def _sql_literal(value) -> str:
     return f"'{escaped}'"
 
 
-def build_query(golden_structure_path: str, queries_dir: str) -> BuildResult:
+def build_query(golden_structure_path: str, queries_dir: str, patch_missing_joins: bool = True) -> BuildResult:
     golden_structure = load_golden_structure(golden_structure_path)
     warnings: list[str] = []
 
@@ -159,12 +211,91 @@ def build_query(golden_structure_path: str, queries_dir: str) -> BuildResult:
             frontier = next_frontier
 
         unreachable = [t for t in table_refs if t not in joined]
+
+        if unreachable and patch_missing_joins:
+            # -- patch pass: no golden field alone connects these tables,
+            # but maybe some query file's actual SQL already joins them (or
+            # joins them via further intermediate tables) directly. Build a
+            # combined graph of golden-derived edges + every direct
+            # real-table JOIN condition found anywhere in queries_dir, and
+            # try to path-find from the tables already joined out to each
+            # orphan, adding whatever new tables/joins that path needs. ----
+            bridge_edges = extract_bridge_edges(queries_dir)
+            full_edges: dict[frozenset, list[tuple[str, str, str, str, str]]] = {}
+            for key, conditions in join_edges.items():
+                for a, b in conditions:
+                    full_edges.setdefault(key, []).append((a.table, a.sql_ref, b.table, b.sql_ref, "golden"))
+            for key, bridge_list in bridge_edges.items():
+                for be in bridge_list:
+                    full_edges.setdefault(key, []).append(
+                        (
+                            be.table_a,
+                            f"{_table_alias(be.table_a)}.{be.col_a}",
+                            be.table_b,
+                            f"{_table_alias(be.table_b)}.{be.col_b}",
+                            f"patched:{be.query_file}",
+                        )
+                    )
+
+            still_unreachable: list[str] = []
+            for t in unreachable:
+                path = _bfs_path(joined, t, full_edges)
+                if not path:
+                    still_unreachable.append(t)
+                    continue
+
+                patched_files: set[str] = set()
+                for parent, node, key in path:
+                    conds = full_edges[key]
+                    golden_conds = [c for c in conds if c[4] == "golden"]
+                    # golden-field-derived conditions are trusted over
+                    # patched ones when both exist for the same table pair.
+                    chosen = golden_conds if golden_conds else conds
+
+                    pairs: list[tuple[str, str]] = []
+                    for ta, sa, tb, sb, label in chosen:
+                        if label != "golden":
+                            patched_files.add(label.split(":", 1)[1])
+                        pair = (sa, sb) if ta == parent else (sb, sa)
+                        if pair not in pairs:
+                            pairs.append(pair)
+
+                    if len(pairs) > 1 and not golden_conds:
+                        warnings.append(
+                            f"multiple different join conditions were found "
+                            f"between '{parent}' and '{node}' across query "
+                            f"files ({', '.join(sorted(patched_files))}) — "
+                            f"using all of them ANDed together; verify this "
+                            f"is correct"
+                        )
+
+                    parts = [f"{left} = {right}" for left, right in pairs]
+                    from_clauses.append(f"LEFT JOIN {node} AS {_table_alias(node)} ON " + " AND ".join(parts))
+                    joined.add(node)
+                    if node not in all_tables:
+                        warnings.append(
+                            f"table '{node}' was added to the query only to "
+                            f"bridge a join path — it's not itself used by "
+                            f"any golden field; verify it's correct and "
+                            f"remove it if unnecessary"
+                        )
+
+                if patched_files:
+                    warnings.append(
+                        f"table '{t}' had no join key derivable from any "
+                        f"golden field alone — patched in using a join "
+                        f"condition found in {', '.join(sorted(patched_files))}; "
+                        f"verify this is correct before relying on it"
+                    )
+
+            unreachable = still_unreachable
+
         for t in unreachable:
             warnings.append(
                 f"table '{t}' shares no golden field with any other joined "
-                f"table, so no join key could be inferred for it — it's "
-                f"left out of the generated FROM/JOIN entirely; add it "
-                f"manually with the correct join key"
+                f"table, and no direct join to it was found in any query "
+                f"file either — it's left out of the generated FROM/JOIN "
+                f"entirely; add it manually with the correct join key"
             )
 
     # -- build the SELECT list --------------------------------------------
