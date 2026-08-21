@@ -38,11 +38,11 @@ DEDUP_ORDER_BY = None
 # that join runs, so a non-unique join key can't fan out the join itself
 # (e.g. joining two collections on a name, which can repeat). No table
 # list needed; without an explicit tie-break order (see
-# DEDUP_JOIN_SOURCES below) the surviving row per key is arbitrary but
-# still deterministic within one query execution.
+# DEDUP_JOIN_SOURCES below), the default is ORDER BY <that table's own
+# cross-field connector column> DESC.
 DEDUP_JOIN_KEYS = False
 # Give a *specific* table an explicit tie-break order instead of (or in
-# addition to) DEDUP_JOIN_KEYS's automatic-but-arbitrary behavior — a
+# addition to) DEDUP_JOIN_KEYS's automatic default — a
 # table named here always uses its own order, even under
 # DEDUP_JOIN_KEYS=True. Only applies to a table used as a non-anchor
 # participant in some field's own spanning-tree join.

@@ -101,9 +101,14 @@ the tool for that):
 
 - ``dedup_join_keys=True`` applies this automatically to *every*
   non-anchor table in *every* field's own spanning tree — no need to
-  name tables individually. Without an explicit tie-break order, the
-  surviving row per join-key value is arbitrary (still deterministic
-  within one query execution, just not something you chose).
+  name tables individually. Without an explicit tie-break order, it
+  defaults to ``ORDER BY <connector_col> DESC`` — the table's own
+  cross-field connector column (see below), descending, so among
+  duplicates the "biggest" value for that column wins. Deliberately not
+  "prefer non-null" (e.g. ``col IS NULL``): picking the largest value
+  tends to land on a more complete/standardized representation, and
+  Spark's default null ordering under ``DESC`` (nulls last) already means
+  a populated value is preferred over a NULL one anyway.
 - ``dedup_join_sources`` (e.g. ``{"analytics_x_cdz.customer":
   ["updatedAt DESC"]}``) gives a *specific* table an explicit tie-break
   order — and works whether or not ``dedup_join_keys`` is set; a table
@@ -474,15 +479,30 @@ def build_query(
                         # dedup_join_keys=True this applies to every
                         # non-anchor table in every field's own spanning
                         # tree automatically; dedup_join_sources still gives
-                        # a specific table an explicit tie-break order
-                        # (falling back to none — an arbitrary but
-                        # deterministic-per-run survivor — otherwise).
+                        # a specific table an explicit tie-break order,
+                        # taking precedence when both apply.
                         partition_cols: list[str] = []
                         for a, b in conditions:
                             join_col = a.column if a.table == other else b.column
                             if join_col not in partition_cols:
                                 partition_cols.append(join_col)
-                        source = _dedup_wrap_source(other, partition_cols, explicit_order_by or [])
+
+                        order_by = explicit_order_by
+                        if not order_by and dedup_join_keys:
+                            # No explicit tie-break given — default to this
+                            # table's own connector column (the column that
+                            # decides how it links to every other golden
+                            # field; see connector_col above), DESC. Picking
+                            # the largest value tends to land on a more
+                            # "complete"/standardized representation among
+                            # duplicates rather than a genuinely arbitrary
+                            # one — this table's own resolved column here is
+                            # exactly what connector_col would register if
+                            # this is the first field to touch it.
+                            default_key = connector_col.get(other, local_tables[other].column)
+                            order_by = [f"{default_key} DESC"]
+
+                        source = _dedup_wrap_source(other, partition_cols, order_by or [])
 
                     from_lines.append(_format_join(source, _table_alias(other), on_parts, keyword="FULL OUTER JOIN"))
                     local_joined.add(other)
