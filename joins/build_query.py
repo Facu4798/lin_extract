@@ -42,15 +42,13 @@ DEDUP_ORDER_BY = None
 # e.g. {"analytics_x_cdz.customer": ["updatedAt DESC"]}. Leave as None/{}
 # to skip.
 DEDUP_JOIN_SOURCES = None
-# If True, emit a sequence of "CREATE OR REPLACE TEMP VIEW ...;" statements
-# (one per stage) plus a final "SELECT ...;", instead of one WITH-clause
-# query — split on ";" and run/cache each statement to let Spark
-# materialize each stage instead of re-deriving the whole upstream chain
-# every time. If False, emit the usual single WITH-clause query.
-AS_TEMP_VIEWS = False
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # result.sql is a sequence of "CREATE OR REPLACE TEMP VIEW ...;"
+    # statements (one per stage) plus a final "SELECT ...;" — split on ";"
+    # and run/cache each statement to let Spark materialize each stage
+    # instead of re-deriving the whole upstream chain every time.
     result = build_query(
         GOLDEN_STRUCTURE_FILE,
         QUERIES_DIR,
@@ -58,7 +56,6 @@ if __name__ == "__main__":
         dedup_partition_by=DEDUP_PARTITION_BY,
         dedup_order_by=DEDUP_ORDER_BY,
         dedup_join_sources=DEDUP_JOIN_SOURCES,
-        as_temp_views=AS_TEMP_VIEWS,
     )
 
     print(result.sql)
