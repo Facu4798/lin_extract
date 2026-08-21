@@ -33,6 +33,15 @@ DEDUP_PARTITION_BY = None  # e.g. ["nationalId"]
 # Golden field names to break dedup ties by; each entry may end in " ASC"
 # or " DESC" (default ASC if omitted) — e.g. ["updatedAt DESC"].
 DEDUP_ORDER_BY = None
+# Real source tables that aren't unique on the column they get joined on
+# within some golden field's own coalesce (e.g. joining two collections on
+# a name, which can repeat) — collapse each to one row per join-key value,
+# tie-broken by the given order-by list, *before* that join runs, so a
+# non-unique key can't fan out the join itself. Only applies to a table
+# used as a non-anchor participant in some field's own spanning-tree join.
+# e.g. {"analytics_x_cdz.customer": ["updatedAt DESC"]}. Leave as None/{}
+# to skip.
+DEDUP_JOIN_SOURCES = None
 # If True, emit a sequence of "CREATE OR REPLACE TEMP VIEW ...;" statements
 # (one per stage) plus a final "SELECT ...;", instead of one WITH-clause
 # query — split on ";" and run/cache each statement to let Spark
@@ -48,6 +57,7 @@ if __name__ == "__main__":
         exclude_sources=EXCLUDE_SOURCES_FILE,
         dedup_partition_by=DEDUP_PARTITION_BY,
         dedup_order_by=DEDUP_ORDER_BY,
+        dedup_join_sources=DEDUP_JOIN_SOURCES,
         as_temp_views=AS_TEMP_VIEWS,
     )
 

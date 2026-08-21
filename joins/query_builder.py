@@ -87,6 +87,21 @@ every field named in either must be one of the golden fields that
 actually made it into the result, or ``build_query`` raises ``ValueError``
 rather than silently ignoring a typo.
 
+That final dedup only cleans up *after* the join has already generated
+however many duplicate rows a non-1:1 key produced — for a single golden
+field whose own coalesce join key just isn't unique per entity in the
+source data (e.g. joining on a name, which can repeat, rather than a
+real id), the fan-out happens *inside* that field's own CTE, before any
+final dedup ever runs. ``dedup_join_sources`` fixes that at the source:
+``{"analytics_x_cdz.customer": ["updatedAt DESC"]}`` collapses that table
+to one row per join-key value (tie-broken by the given order) *before*
+it's used as a non-anchor participant in any field's own spanning-tree
+join, so the join itself can never fan out from that table's side. Only
+covers non-anchor participants — a field's own anchor table (the root of
+its spanning tree) has no single incoming join condition to dedup
+against; if the anchor itself isn't unique, ``dedup_partition_by``/
+``dedup_order_by`` on the final result is still the tool for that.
+
 **Output format.** By default ``.sql`` is one query using a ``WITH``
 clause (each CTE referenced exactly once, so Spark just inlines it —
 no different from nesting the same thing as subqueries). Pass
@@ -214,6 +229,40 @@ def _select_item(args: list[str], alias: str) -> str:
     return f"COALESCE(\n{inner}\n    ) AS {alias}"
 
 
+def _parse_order_by_entry(entry: str, context: str) -> str:
+    """Parse one "field" or "field ASC"/"field DESC" entry, returning
+    "field DIRECTION". Raises ValueError (with ``context`` in the
+    message) on an unrecognized direction."""
+    field, _, direction = entry.strip().partition(" ")
+    direction = direction.strip().upper() or "ASC"
+    if direction not in ("ASC", "DESC"):
+        raise ValueError(f"{context}: invalid direction '{direction}' for '{field}' — use 'ASC' or 'DESC'")
+    return field, direction
+
+
+def _dedup_wrap_source(table: str, partition_cols: list[str], order_by: list[str]) -> str:
+    """A ``(...)`` subquery that reduces ``table`` to exactly one row per
+    ``partition_cols`` combination, tie-broken by ``order_by`` — used to
+    pre-dedup a table on its own join key *before* it's joined, so a
+    non-unique key can't fan out the join itself. See
+    ``dedup_join_sources`` on ``build_query``."""
+    order_parts = [
+        f"{field} {direction}" for field, direction in (_parse_order_by_entry(e, f"dedup_join_sources[{table!r}]") for e in order_by)
+    ]
+    return (
+        "(\n"
+        "        SELECT * FROM (\n"
+        "            SELECT *, ROW_NUMBER() OVER (\n"
+        f"                PARTITION BY {', '.join(partition_cols)}\n"
+        f"                ORDER BY {', '.join(order_parts)}\n"
+        "            ) AS _dedup_join_rn\n"
+        f"            FROM {table}\n"
+        "        )\n"
+        "        WHERE _dedup_join_rn = 1\n"
+        "    )"
+    )
+
+
 def build_query(
     golden_structure_path: str,
     queries_dir: str,
@@ -221,10 +270,12 @@ def build_query(
     exclude_sources: "str | set[str] | list[str] | None" = None,
     dedup_partition_by: "list[str] | None" = None,
     dedup_order_by: "list[str] | None" = None,
+    dedup_join_sources: "dict[str, list[str]] | None" = None,
     as_temp_views: bool = False,
 ) -> BuildResult:
     golden_structure = load_golden_structure(golden_structure_path)
     warnings: list[str] = []
+    dedup_join_sources = dedup_join_sources or {}
 
     exclusions: set[str] = set()
     if isinstance(exclude_sources, str):
@@ -315,6 +366,21 @@ def build_query(
         field_tables[gname] = local_tables
         field_join_edges[gname] = local_edges
 
+    if dedup_join_sources:
+        all_known_tables = {t for lt in field_tables.values() for t in lt}
+        unknown_tables = [t for t in dedup_join_sources if t not in all_known_tables]
+        if unknown_tables:
+            raise ValueError(
+                f"dedup_join_sources references table(s) never used by any "
+                f"golden field: {', '.join(sorted(unknown_tables))} "
+                f"(known tables: {', '.join(sorted(all_known_tables))})"
+            )
+        for table, order_by in dedup_join_sources.items():
+            if not order_by:
+                raise ValueError(f"dedup_join_sources[{table!r}] needs a non-empty order-by list to break ties deterministically")
+            for entry in order_by:
+                _parse_order_by_entry(entry, f"dedup_join_sources[{table!r}]")  # validates early, result unused here
+
     # -- build one CTE per golden field, folding each into a growing
     # "entity" CTE chain via whichever physical table(s) it shares with
     # what's been built so far (or a bridged connection). ------------------
@@ -375,7 +441,21 @@ def build_query(
                     if other in local_joined:
                         continue
                     on_parts = [f"{a.sql_ref} = {b.sql_ref}" for a, b in conditions]
-                    from_lines.append(_format_join(other, _table_alias(other), on_parts, keyword="FULL OUTER JOIN"))
+
+                    source = other
+                    if other in dedup_join_sources:
+                        # This table isn't unique on the column it's being
+                        # joined on here — collapse it to one row per that
+                        # column *before* the join runs, so the join itself
+                        # can't fan out from a non-unique key.
+                        partition_cols: list[str] = []
+                        for a, b in conditions:
+                            join_col = a.column if a.table == other else b.column
+                            if join_col not in partition_cols:
+                                partition_cols.append(join_col)
+                        source = _dedup_wrap_source(other, partition_cols, dedup_join_sources[other])
+
+                    from_lines.append(_format_join(source, _table_alias(other), on_parts, keyword="FULL OUTER JOIN"))
                     local_joined.add(other)
                     next_frontier.append(other)
             frontier = next_frontier
