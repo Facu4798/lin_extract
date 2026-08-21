@@ -33,12 +33,19 @@ DEDUP_PARTITION_BY = None  # e.g. ["nationalId"]
 # Golden field names to break dedup ties by; each entry may end in " ASC"
 # or " DESC" (default ASC if omitted) — e.g. ["updatedAt DESC"].
 DEDUP_ORDER_BY = None
-# Real source tables that aren't unique on the column they get joined on
-# within some golden field's own coalesce (e.g. joining two collections on
-# a name, which can repeat) — collapse each to one row per join-key value,
-# tie-broken by the given order-by list, *before* that join runs, so a
-# non-unique key can't fan out the join itself. Only applies to a table
-# used as a non-anchor participant in some field's own spanning-tree join.
+# If True, automatically collapse every non-anchor table in every golden
+# field's own spanning-tree join to one row per join-key value *before*
+# that join runs, so a non-unique join key can't fan out the join itself
+# (e.g. joining two collections on a name, which can repeat). No table
+# list needed; without an explicit tie-break order (see
+# DEDUP_JOIN_SOURCES below) the surviving row per key is arbitrary but
+# still deterministic within one query execution.
+DEDUP_JOIN_KEYS = False
+# Give a *specific* table an explicit tie-break order instead of (or in
+# addition to) DEDUP_JOIN_KEYS's automatic-but-arbitrary behavior — a
+# table named here always uses its own order, even under
+# DEDUP_JOIN_KEYS=True. Only applies to a table used as a non-anchor
+# participant in some field's own spanning-tree join.
 # e.g. {"analytics_x_cdz.customer": ["updatedAt DESC"]}. Leave as None/{}
 # to skip.
 DEDUP_JOIN_SOURCES = None
@@ -56,6 +63,7 @@ if __name__ == "__main__":
         dedup_partition_by=DEDUP_PARTITION_BY,
         dedup_order_by=DEDUP_ORDER_BY,
         dedup_join_sources=DEDUP_JOIN_SOURCES,
+        dedup_join_keys=DEDUP_JOIN_KEYS,
     )
 
     print(result.sql)

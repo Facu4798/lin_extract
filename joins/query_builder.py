@@ -92,15 +92,29 @@ however many duplicate rows a non-1:1 key produced — for a single golden
 field whose own coalesce join key just isn't unique per entity in the
 source data (e.g. joining on a name, which can repeat, rather than a
 real id), the fan-out happens *inside* that field's own CTE, before any
-final dedup ever runs. ``dedup_join_sources`` fixes that at the source:
-``{"analytics_x_cdz.customer": ["updatedAt DESC"]}`` collapses that table
-to one row per join-key value (tie-broken by the given order) *before*
-it's used as a non-anchor participant in any field's own spanning-tree
-join, so the join itself can never fan out from that table's side. Only
-covers non-anchor participants — a field's own anchor table (the root of
-its spanning tree) has no single incoming join condition to dedup
-against; if the anchor itself isn't unique, ``dedup_partition_by``/
-``dedup_order_by`` on the final result is still the tool for that.
+final dedup ever runs. Two ways to fix that at the source, both only
+covering *non-anchor* participants in a field's own spanning-tree join
+(the anchor — the root of that tree — has no single incoming join
+condition to dedup against; if the anchor itself isn't unique,
+``dedup_partition_by``/``dedup_order_by`` on the final result is still
+the tool for that):
+
+- ``dedup_join_keys=True`` applies this automatically to *every*
+  non-anchor table in *every* field's own spanning tree — no need to
+  name tables individually. Without an explicit tie-break order, the
+  surviving row per join-key value is arbitrary (still deterministic
+  within one query execution, just not something you chose).
+- ``dedup_join_sources`` (e.g. ``{"analytics_x_cdz.customer":
+  ["updatedAt DESC"]}``) gives a *specific* table an explicit tie-break
+  order — and works whether or not ``dedup_join_keys`` is set; a table
+  named here always uses its given order, even under the blanket
+  ``dedup_join_keys=True``.
+
+Either way, the table is collapsed to one row per join-key value
+*before* it's joined, so the join itself can never fan out from that
+table's side — this is currently scoped to joins *within* a single
+golden field's own coalesce only, not to entity-merge or bridge joins
+across different fields.
 
 **Output format.** ``.sql`` is a sequence of standalone
 ``CREATE OR REPLACE TEMP VIEW <name> AS (...);`` statements, one per
@@ -237,25 +251,38 @@ def _parse_order_by_entry(entry: str, context: str) -> str:
 
 def _dedup_wrap_source(table: str, partition_cols: list[str], order_by: list[str]) -> str:
     """A ``(...)`` subquery that reduces ``table`` to exactly one row per
-    ``partition_cols`` combination, tie-broken by ``order_by`` — used to
-    pre-dedup a table on its own join key *before* it's joined, so a
-    non-unique key can't fan out the join itself. See
-    ``dedup_join_sources`` on ``build_query``."""
-    order_parts = [
-        f"{field} {direction}" for field, direction in (_parse_order_by_entry(e, f"dedup_join_sources[{table!r}]") for e in order_by)
+    ``partition_cols`` combination, tie-broken by ``order_by`` if given —
+    used to pre-dedup a table on its own join key *before* it's joined,
+    so a non-unique key can't fan out the join itself. See
+    ``dedup_join_keys``/``dedup_join_sources`` on ``build_query``.
+
+    ``order_by`` may be empty — Spark allows ``ROW_NUMBER()`` with no
+    ``ORDER BY``, at the cost of the surviving row being arbitrary (still
+    deterministic within one query execution, not stable across runs).
+    Only used when a table is deduped automatically via
+    ``dedup_join_keys`` and wasn't also given an explicit tie-break via
+    ``dedup_join_sources``.
+    """
+    lines = [
+        "(",
+        "        SELECT * FROM (",
+        "            SELECT *, ROW_NUMBER() OVER (",
+        f"                PARTITION BY {', '.join(partition_cols)}",
     ]
-    return (
-        "(\n"
-        "        SELECT * FROM (\n"
-        "            SELECT *, ROW_NUMBER() OVER (\n"
-        f"                PARTITION BY {', '.join(partition_cols)}\n"
-        f"                ORDER BY {', '.join(order_parts)}\n"
-        "            ) AS _dedup_join_rn\n"
-        f"            FROM {table}\n"
-        "        )\n"
-        "        WHERE _dedup_join_rn = 1\n"
-        "    )"
-    )
+    if order_by:
+        order_parts = [
+            f"{field} {direction}"
+            for field, direction in (_parse_order_by_entry(e, f"dedup_join_sources[{table!r}]") for e in order_by)
+        ]
+        lines.append(f"                ORDER BY {', '.join(order_parts)}")
+    lines += [
+        "            ) AS _dedup_join_rn",
+        f"            FROM {table}",
+        "        )",
+        "        WHERE _dedup_join_rn = 1",
+        "    )",
+    ]
+    return "\n".join(lines)
 
 
 def build_query(
@@ -266,6 +293,7 @@ def build_query(
     dedup_partition_by: "list[str] | None" = None,
     dedup_order_by: "list[str] | None" = None,
     dedup_join_sources: "dict[str, list[str]] | None" = None,
+    dedup_join_keys: bool = False,
 ) -> BuildResult:
     golden_structure = load_golden_structure(golden_structure_path)
     warnings: list[str] = []
@@ -437,17 +465,24 @@ def build_query(
                     on_parts = [f"{a.sql_ref} = {b.sql_ref}" for a, b in conditions]
 
                     source = other
-                    if other in dedup_join_sources:
-                        # This table isn't unique on the column it's being
-                        # joined on here — collapse it to one row per that
-                        # column *before* the join runs, so the join itself
-                        # can't fan out from a non-unique key.
+                    explicit_order_by = dedup_join_sources.get(other)
+                    if dedup_join_keys or explicit_order_by:
+                        # This table might not be unique on the column it's
+                        # being joined on here — collapse it to one row per
+                        # that column *before* the join runs, so the join
+                        # itself can't fan out from a non-unique key. With
+                        # dedup_join_keys=True this applies to every
+                        # non-anchor table in every field's own spanning
+                        # tree automatically; dedup_join_sources still gives
+                        # a specific table an explicit tie-break order
+                        # (falling back to none — an arbitrary but
+                        # deterministic-per-run survivor — otherwise).
                         partition_cols: list[str] = []
                         for a, b in conditions:
                             join_col = a.column if a.table == other else b.column
                             if join_col not in partition_cols:
                                 partition_cols.append(join_col)
-                        source = _dedup_wrap_source(other, partition_cols, dedup_join_sources[other])
+                        source = _dedup_wrap_source(other, partition_cols, explicit_order_by or [])
 
                     from_lines.append(_format_join(source, _table_alias(other), on_parts, keyword="FULL OUTER JOIN"))
                     local_joined.add(other)
